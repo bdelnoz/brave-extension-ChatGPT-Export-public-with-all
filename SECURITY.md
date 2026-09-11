@@ -1,4 +1,4 @@
-# SECURITY - ChatGPT Export by NoXoZ.be
+# SECURITY - ChatGPT Export by NoXoZ.be v6.1.2
 
 > Independent project. Not affiliated with, endorsed by, sponsored by, or officially connected to OpenAI. Author: Bruno DELNOZ / NoXoZ.be.
 
@@ -11,6 +11,7 @@ ChatGPT Export is a local browser extension.
 - No telemetry endpoint.
 - Exports are generated locally as Markdown/ZIP files.
 - File bundling can access eligible ChatGPT/OpenAI-hosted resources associated with the active browser session.
+- ALL Full Chat is processed sequentially and split into ZIP batches to limit peak in-memory archive size.
 
 ## Download validation
 

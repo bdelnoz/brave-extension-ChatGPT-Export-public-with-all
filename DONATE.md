@@ -1,4 +1,4 @@
-# Support ChatGPT Export by NoXoZ.be
+# Support ChatGPT Export by NoXoZ.be v6.1.2
 
 ChatGPT Export is developed and maintained as a free browser extension.
 
