@@ -1,4 +1,4 @@
-# INSTALL - ChatGPT Export by NoXoZ.be v6.1.2
+# INSTALL - ChatGPT Export by NoXoZ.be v6.1.4
 
 > Independent project. Not affiliated with, endorsed by, sponsored by, or officially connected to OpenAI. Author: Bruno DELNOZ / NoXoZ.be.
 
@@ -17,7 +17,7 @@ Use `chrome://extensions/` and follow the same **Load unpacked** procedure.
 
 ## ALL Full Chat
 
-For large accounts, use **Number of chats to export per ZIP** in Maxi mode or **#inZip** in Mini mode. A value such as `50` limits each ALL Full Chat ZIP to 50 chats and reduces peak memory usage. ALL Full Chat always uses FULL mode; Start/End controls are not used.
+For large exports, use **Number of chats to export per ZIP** in Maxi mode or **#inZip** in Mini mode. A value such as `5` limits each Full Project or ALL Full Chat ZIP to 5 chats and reduces peak memory usage. Each batch is finalized before the next batch starts. ALL Full Chat always uses FULL mode; Start/End controls are not used.
 
 ## Runtime files
 

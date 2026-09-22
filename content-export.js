@@ -1,13 +1,15 @@
 /*
  * ChatGPT Export - content-export.js
- * Version: v6.0.0
+ * Version: v6.1.4
+ * Patch: p24
  * Developer: @NoXoZ.be
  * Local current-chat, project, and ALL-account-chat export.
  */
 (function cgxInit() {
   'use strict';
 
-  const VERSION = '6.1.2';
+  const VERSION = '6.1.4';
+  const PATCH = 'p24';
   const WIDGET_ID = 'cgx-widget';
   const LOADED_KEY = '__CGX_EXPORT_V503_LOADED__';
   const STORAGE_KEY = 'cgx.v3.state';
@@ -19,6 +21,7 @@
     exportMode: 'full',
     projectFullUi: false,
     allFullUi: false,
+    projectSourcesUi: false,
     exportUploadedFiles: true,
     exportDownloadedFiles: false,
     messages: 25,
@@ -38,7 +41,7 @@
 
   let widget = null;
   let state = structuredCloneSafe(DEFAULTS);
-  let runtime = { exporting: false, stop: false, status: 'Ready', logs: [], folderHandle: null, metrics: createMetrics(), clickedExpandKeys: new Set() };
+  let runtime = { exporting: false, stop: false, status: 'Ready', logs: [], folderHandle: null, batchFolderPrepared: false, downloadTarget: '', metrics: createMetrics(), clickedExpandKeys: new Set() };
   const conversationDataCache = new Map();
   let drag = null;
   let resizeDrag = null;
@@ -89,6 +92,7 @@
     if (!['full', 'start', 'end'].includes(state.exportMode)) state.exportMode = 'full';
     if (typeof state.projectFullUi !== 'boolean') state.projectFullUi = false;
     if (typeof state.allFullUi !== 'boolean') state.allFullUi = false;
+    if (typeof state.projectSourcesUi !== 'boolean') state.projectSourcesUi = false;
     if (typeof state.exportUploadedFiles !== 'boolean') state.exportUploadedFiles = true;
     if (typeof state.exportDownloadedFiles !== 'boolean') state.exportDownloadedFiles = false;
 
@@ -105,12 +109,213 @@
       state.exportMode = 'full';
       state.projectFullUi = false;
       state.allFullUi = false;
+      state.projectSourcesUi = false;
       state.askSave = true;
       state.defaultsRevision = DEFAULTS_REVISION;
     }
   }
 
   async function saveState() { await storageSet({ [STORAGE_KEY]: state }); }
+
+  const BATCH_FOLDER_DB = 'cgx-export-batch-folder-v1';
+  const BATCH_FOLDER_STORE = 'handles';
+  const BATCH_FOLDER_KEY = 'active';
+
+  function openBatchFolderDb() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) { reject(new Error('INDEXEDDB_UNAVAILABLE')); return; }
+      const request = window.indexedDB.open(BATCH_FOLDER_DB, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(BATCH_FOLDER_STORE)) db.createObjectStore(BATCH_FOLDER_STORE);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('INDEXEDDB_OPEN_FAILED'));
+    });
+  }
+
+  async function storeBatchFolderHandle(handle, stamp, kind) {
+    if (!handle || !stamp) return;
+    const db = await openBatchFolderDb();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(BATCH_FOLDER_STORE, 'readwrite');
+        tx.objectStore(BATCH_FOLDER_STORE).put({ handle, stamp: String(stamp), kind: String(kind || ''), savedAt: Date.now() }, BATCH_FOLDER_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('BATCH_FOLDER_STORE_FAILED'));
+        tx.onabort = () => reject(tx.error || new Error('BATCH_FOLDER_STORE_ABORTED'));
+      });
+    } finally { db.close(); }
+  }
+
+  async function loadBatchFolderHandle(stamp) {
+    if (!stamp) return null;
+    const db = await openBatchFolderDb();
+    try {
+      const record = await new Promise((resolve, reject) => {
+        const tx = db.transaction(BATCH_FOLDER_STORE, 'readonly');
+        const req = tx.objectStore(BATCH_FOLDER_STORE).get(BATCH_FOLDER_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error || new Error('BATCH_FOLDER_LOAD_FAILED'));
+      });
+      if (!record?.handle || String(record.stamp || '') !== String(stamp)) return null;
+      return record.handle;
+    } finally { db.close(); }
+  }
+
+  async function clearBatchFolderHandle(stamp = '') {
+    try {
+      const db = await openBatchFolderDb();
+      try {
+        if (stamp) {
+          const record = await new Promise((resolve, reject) => {
+            const tx = db.transaction(BATCH_FOLDER_STORE, 'readonly');
+            const req = tx.objectStore(BATCH_FOLDER_STORE).get(BATCH_FOLDER_KEY);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error || new Error('BATCH_FOLDER_LOAD_FAILED'));
+          });
+          if (record && String(record.stamp || '') !== String(stamp)) return;
+        }
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(BATCH_FOLDER_STORE, 'readwrite');
+          tx.objectStore(BATCH_FOLDER_STORE).delete(BATCH_FOLDER_KEY);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error || new Error('BATCH_FOLDER_CLEAR_FAILED'));
+          tx.onabort = () => reject(tx.error || new Error('BATCH_FOLDER_CLEAR_ABORTED'));
+        });
+      } finally { db.close(); }
+    } catch { /* best effort */ }
+  }
+
+  async function prepareBatchFolderFromStartGesture(forceAskSave = false, forceChat = false) {
+    // p18: Project/ALL ZIP filenames include the chat name (or first-to-last chat names for multi-chat batches).
+    // Every ZIP part is autosaved through chrome.downloads under the browser's
+    // default Downloads directory. Current-chat exports keep their legacy flow.
+    const batchedExport = !forceChat && (state.projectFullUi || state.allFullUi);
+    if (batchedExport) {
+      runtime.folderHandle = null;
+      runtime.batchFolderPrepared = false;
+      return true;
+    }
+    return true;
+  }
+
+  async function chooseBatchFolder(stamp, kind, askForLocation) {
+    // p14: intentionally no picker for Project/ALL. The destination is a
+    // relative path below the browser default Downloads folder.
+    runtime.folderHandle = null;
+    runtime.batchFolderPrepared = false;
+    return null;
+  }
+
+  async function restoreBatchFolder(stamp) {
+    // Kept as a compatibility no-op for older persisted jobs.
+    runtime.folderHandle = null;
+    return null;
+  }
+
+  function underscoreToken(value, fallback = 'Export') {
+    return safeFilenameBase(value || fallback)
+      .trim()
+      .replace(/\s+/g, '_')
+      .replace(/-+/g, '_')
+      .replace(/_+/g, '_');
+  }
+
+  async function detectBrowserName() {
+    try {
+      if (navigator.brave && typeof navigator.brave.isBrave === 'function' && await navigator.brave.isBrave()) return 'Brave';
+    } catch { /* ignore */ }
+    const ua = String(navigator.userAgent || '');
+    if (/Edg\//.test(ua)) return 'Edge';
+    if (/OPR\//.test(ua)) return 'Opera';
+    if (/Firefox\//.test(ua)) return 'Firefox';
+    if (/Chrome\//.test(ua) || /Chromium\//.test(ua)) return 'Chrome';
+    return 'Browser';
+  }
+
+  function batchDownloadFolder(kind, projectName = '', accountName = '', browserName = '') {
+    const browserPart = underscoreToken(browserName || 'Browser', 'Browser');
+    const accountPart = underscoreToken(accountName || 'ChatGPT Account', 'ChatGPT_Account');
+    const leaf = kind === 'project'
+      ? underscoreToken(projectName || 'Project', 'Project')
+      : 'ALL_Full_Chat';
+    return `ChatGPT-Export/${browserPart}/${accountPart}/${leaf}`;
+  }
+
+  function bytesToBase64Chunk(bytes) {
+    let binary = '';
+    const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    const step = 0x8000;
+    for (let i = 0; i < view.length; i += step) {
+      binary += String.fromCharCode(...view.subarray(i, Math.min(view.length, i + step)));
+    }
+    return btoa(binary);
+  }
+
+  async function saveBatchZipToDownloads(filename, bytes, kind, projectName = '', accountName = '', browserName = '') {
+    const folder = batchDownloadFolder(kind, projectName, accountName, browserName);
+    const askSave = Boolean(state.askSave);
+    const relativePath = askSave ? filename : `${folder}/${filename}`;
+    const transferId = `cgx-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    const chunkSize = 1024 * 1024;
+    const totalChunks = Math.max(1, Math.ceil(view.length / chunkSize));
+    runtime.downloadTarget = askSave ? 'Save As dialog' : `Downloads/${folder}/`;
+
+    try {
+      const prep = await runtimeMessage({ type: 'CGX_PREPARE_OFFSCREEN_DOWNLOAD' });
+      if (!prep?.ok) throw new Error(prep?.error || 'OFFSCREEN_PREPARE_FAILED');
+
+      let response = await runtimeMessage({
+        target: 'offscreen',
+        type: 'CGX_OFFSCREEN_ZIP_BEGIN',
+        transferId,
+        relativePath,
+        totalBytes: view.length,
+        totalChunks
+      });
+      if (!response?.ok) throw new Error(response?.error || 'OFFSCREEN_BEGIN_FAILED');
+
+      for (let index = 0; index < totalChunks; index += 1) {
+        const start = index * chunkSize;
+        const end = Math.min(view.length, start + chunkSize);
+        const base64 = bytesToBase64Chunk(view.subarray(start, end));
+        response = await runtimeMessage({
+          target: 'offscreen',
+          type: 'CGX_OFFSCREEN_ZIP_CHUNK',
+          transferId,
+          index,
+          base64
+        });
+        if (!response?.ok) throw new Error(response?.error || `OFFSCREEN_CHUNK_${index}_FAILED`);
+      }
+
+      const committed = await runtimeMessage({
+        target: 'offscreen',
+        type: 'CGX_OFFSCREEN_ZIP_COMMIT',
+        transferId
+      });
+      if (!committed?.ok || !committed.url) throw new Error(committed?.error || 'OFFSCREEN_COMMIT_FAILED');
+
+      const saved = await runtimeMessage({
+        type: 'CGX_DOWNLOAD_BATCH_ZIP',
+        url: committed.url,
+        filename,
+        relativePath,
+        saveAs: askSave,
+        transferId
+      });
+      if (!saved?.ok) throw new Error(saved?.error || 'BATCH_DOWNLOAD_FAILED');
+      log(`batch save complete mode=${askSave ? 'save-as' : 'autosave'} ${relativePath}${saved.downloadId ? ` downloadId=${saved.downloadId}` : ''}`);
+      return saved;
+    } catch (error) {
+      try {
+        await runtimeMessage({ target: 'offscreen', type: 'CGX_OFFSCREEN_ZIP_ABORT', transferId });
+      } catch { /* best effort */ }
+      throw error;
+    }
+  }
 
   function setStatus(text) {
     runtime.status = String(text || '');
@@ -174,7 +379,8 @@
   }
 
   function header() {
-    const first = `ChatGPT Export  @NoXoZ.be - v${VERSION}`;
+    const displayVersion = state.dev ? `v${VERSION} ${PATCH}` : `v${VERSION}`;
+    const first = `ChatGPT Export  @NoXoZ.be - ${displayVersion}`;
     return `
       <div class="cgx-header" data-drag="true">
         <div class="cgx-title-row"><div class="cgx-title">${esc(first)}</div></div>
@@ -191,7 +397,7 @@
   }
 
   function rangeButton(mode, label) {
-    return `<button class="cgx-range ${!state.projectFullUi && state.exportMode === mode ? 'selected' : ''}" data-range="${mode}">${esc(label)}</button>`;
+    return `<button class="cgx-range ${!state.projectFullUi && !state.allFullUi && !state.projectSourcesUi && state.exportMode === mode ? 'selected' : ''}" data-range="${mode}">${esc(label)}</button>`;
   }
 
   function allFullUiButton(label, mini = false) {
@@ -200,6 +406,10 @@
 
   function projectUiButton(label, mini = false) {
     return `<button class="cgx-range ${mini ? 'cgx-mini-project ' : ''}${state.projectFullUi ? 'selected' : ''}" data-project-ui="true">${esc(label)}</button>`;
+  }
+
+  function projectSourcesUiButton(label) {
+    return `<button class="cgx-range ${state.projectSourcesUi ? 'selected' : ''}" data-project-sources-ui="true">${esc(label)}</button>`;
   }
 
   function fileExportToggleButton(kind, label, mini = false) {
@@ -218,6 +428,7 @@
         ${rangeButton('full', 'Export Full Chat')}
         ${rangeButton('start', 'Export From Start')}
         ${rangeButton('end', 'Export From End')}
+        ${currentProjectId() ? projectSourcesUiButton('Export all sources from this project') : ''}
       </div>`;
   }
 
@@ -277,7 +488,7 @@
 
   function devPanel() {
     if (!state.dev) return '';
-    const folder = runtime.folderHandle ? runtime.folderHandle.name : 'not set';
+    const folder = runtime.downloadTarget || (runtime.folderHandle ? runtime.folderHandle.name : 'not set');
     return `
       <div class="cgx-dev-box">
         <div class="cgx-dev-title">DEVELOPER MODE</div>
@@ -296,6 +507,7 @@
           `exportMode=${state.exportMode}`,
           `projectFullUi=${state.projectFullUi}`,
           `allFullUi=${state.allFullUi}`,
+          `projectSourcesUi=${state.projectSourcesUi}`,
           `exportUploadedFiles=${state.exportUploadedFiles}`,
           `exportDownloadedFiles=${state.exportDownloadedFiles}`,
           `visible=${state.visible}`,
@@ -411,7 +623,7 @@
           <button class="cgx-choice ${state.askSave ? 'selected yes' : ''}" data-bool="askSave" data-value="true">Yes</button>
         </div>
         <div class="cgx-status mini">${esc(runtime.status)}</div>
-        <div class="cgx-footer-mini">@NoXoZ.be<br>v${VERSION}</div>
+        <div class="cgx-footer-mini">@NoXoZ.be<br>${state.dev ? `v${VERSION} ${PATCH}` : `v${VERSION}`}</div>
       </div>`;
   }
 
@@ -425,6 +637,9 @@
   function render() {
     if (!widget) return;
     widget.className = `cgx-mode-${state.mode} ${state.dev ? 'cgx-dev' : ''} ${runtime.exporting ? 'cgx-exporting' : ''}`;
+    widget.dataset.cgxBatchExport = (!runtime.exporting && (state.projectFullUi || state.allFullUi)) ? '1' : '0';
+    widget.dataset.cgxExporting = runtime.exporting ? '1' : '0';
+    widget.dataset.cgxAutosave = 'p24';
     widget.style.display = state.visible ? '' : 'none';
     if (!state.visible) return;
     applyModeSize();
@@ -451,11 +666,13 @@
       if (action === 'toggle-dev') { state.dev = !state.dev; await saveState(); render(); }
       if (action === 'mode-down') await modeDown();
       if (action === 'mode-up') await modeUp();
-      if (action === 'export') await exportOrStop(false);
+      if (action === 'export') {
+        await exportOrStop(false);
+      }
       if (action === 'stop') requestStop();
       if (action === 'reload') reloadExt();
       if (action === 'pick-folder') await pickFolder();
-      if (action === 'clear-folder') { runtime.folderHandle = null; setStatus('Target cleared'); }
+      if (action === 'clear-folder') { runtime.folderHandle = null; await clearBatchFolderHandle(); setStatus('Target cleared'); render(); }
       if (action === 'export-log') exportDevLog();
     }));
 
@@ -470,14 +687,24 @@
     widget.querySelectorAll('[data-all-ui]').forEach((el) => el.addEventListener('click', async (e) => {
       e.preventDefault(); e.stopPropagation();
       state.allFullUi = !state.allFullUi;
-      if (state.allFullUi) state.projectFullUi = false;
+      if (state.allFullUi) { state.projectFullUi = false; state.projectSourcesUi = false; }
       await saveState(); render();
     }));
 
     widget.querySelectorAll('[data-project-ui]').forEach((el) => el.addEventListener('click', async (e) => {
       e.preventDefault(); e.stopPropagation();
       state.projectFullUi = !state.projectFullUi;
-      if (state.projectFullUi) state.allFullUi = false;
+      if (state.projectFullUi) { state.allFullUi = false; state.projectSourcesUi = false; }
+      await saveState(); render();
+    }));
+
+    widget.querySelectorAll('[data-project-sources-ui]').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      state.projectSourcesUi = !state.projectSourcesUi;
+      if (state.projectSourcesUi) {
+        state.projectFullUi = false;
+        state.allFullUi = false;
+      }
       await saveState(); render();
     }));
 
@@ -493,6 +720,7 @@
       e.preventDefault(); e.stopPropagation();
       state.projectFullUi = false;
       state.allFullUi = false;
+      state.projectSourcesUi = false;
       state.exportMode = el.dataset.range;
       await saveState(); render();
     }));
@@ -531,6 +759,9 @@
       requestStop();
       return;
     }
+    // p18: Project/ALL start immediately; chrome.downloads decides autosave vs Save As from state.askSave.
+    const canStart = await prepareBatchFolderFromStartGesture(forceAskSave, forceChat);
+    if (!canStart) return;
     await startExport(forceFull, forceAskSave, forceChat);
   }
 
@@ -678,12 +909,16 @@
 
   async function startExport(forceFull = false, forceAskSave = false, forceChat = false) {
     if (runtime.exporting) return;
+    if (state.projectSourcesUi && !forceChat) {
+      await exportAllProjectSources();
+      return;
+    }
     if (state.allFullUi && !forceChat) {
-      await startAllChatExport(forceAskSave ? true : state.askSave);
+      await startAllChatExport(true);
       return;
     }
     if (state.projectFullUi && !forceChat) {
-      await startProjectExport(forceAskSave ? true : state.askSave);
+      await startProjectExport(true);
       return;
     }
     runtime.exporting = true;
@@ -1033,11 +1268,28 @@
   }
 
   function projectStamp() {
-    return new Date().toISOString().replace(/[:T]/g, '-').replace(/\.\d+Z$/, '');
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}-${pad(d.getMinutes())}`;
   }
 
-  function makeProjectZipFilename(projectName, stamp = projectStamp()) {
-    return `Full Project - ${safeFilenameBase(projectName)}__export_${stamp}.zip`;
+  function batchChatFilenameToken(chats = []) {
+    const names = (Array.isArray(chats) ? chats : [])
+      .map((c) => underscoreToken(c?.chatTitle || c?.titleHint || c?.title || '', ''))
+      .filter(Boolean);
+    if (!names.length) return 'Chat';
+    const trim = (v) => String(v).slice(0, 60).replace(/_+$/g, '') || 'Chat';
+    if (names.length === 1) return `Chat_${trim(names[0])}`;
+    return `Chats_${trim(names[0])}__to__${trim(names[names.length - 1])}`;
+  }
+
+  function makeProjectZipFilename(projectName, stamp = projectStamp(), batchIndex = 1, totalBatches = 1, browserName = '', accountName = '', chats = []) {
+    const browserPart = underscoreToken(browserName || 'Browser', 'Browser');
+    const accountPart = underscoreToken(accountName || 'ChatGPT Account', 'ChatGPT_Account');
+    const chatPart = batchChatFilenameToken(chats);
+    const prefix = `Full_Project_${underscoreToken(projectName, 'Project')}__${chatPart}__${browserPart}__${accountPart}__export_${stamp}`;
+    if (totalBatches > 1) return `${prefix}__part_${String(batchIndex).padStart(3, '0')}_of_${String(totalBatches).padStart(3, '0')}.zip`;
+    return `${prefix}.zip`;
   }
 
   function buildProjectIndex(projectName, results, failures, exportedAt) {
@@ -1306,6 +1558,18 @@
           user?.name || user?.displayName || user?.full_name || user?.email ||
           data?.name || data?.displayName || data?.email || ''
         );
+        if (!authState.accountId) {
+          authState.accountId = String(
+            data?.account?.id || data?.accountId || user?.account_id || user?.accountId || ''
+          ).trim();
+        }
+        if (!authState.accountId && authState.token) {
+          try {
+            const payload = JSON.parse(atob(authState.token.split('.')[1] || ''));
+            const claim = payload?.['https://api.openai.com/auth'] || {};
+            authState.accountId = String(claim?.chatgpt_account_id || claim?.account_id || '').trim();
+          } catch { /* JWT fallback unavailable */ }
+        }
       }
     } catch { /* keep cookie-only auth fallback */ }
 
@@ -1371,11 +1635,13 @@
     const metaUrl = metaDownloadUrlFromBytes(bytes, contentType);
 
     if (metaUrl) {
-      const finalResult = await fetchAttachmentBytes(metaUrl);
+      let resolvedMetaUrl = metaUrl;
+      try { resolvedMetaUrl = new URL(metaUrl, location.origin).href; } catch { /* keep original */ }
+      const finalResult = await fetchAttachmentBytes(resolvedMetaUrl);
       return {
         bytes: finalResult.bytes,
         contentType: finalResult.contentType,
-        finalUrl: finalResult.finalUrl || metaUrl,
+        finalUrl: finalResult.finalUrl || resolvedMetaUrl,
         size: finalResult.bytes.length
       };
     }
@@ -1398,6 +1664,467 @@
         });
       } catch (error) { reject(error); }
     });
+  }
+
+  function deepStringByKeys(value, wantedKeys, depth = 0) {
+    if (depth > 7 || value == null) return '';
+    if (typeof value !== 'object') return '';
+    for (const [key, child] of Object.entries(value)) {
+      if (wantedKeys.has(String(key).toLowerCase()) && typeof child === 'string' && child.trim()) {
+        return child.trim();
+      }
+    }
+    for (const child of Object.values(value)) {
+      if (child && typeof child === 'object') {
+        const found = deepStringByKeys(child, wantedKeys, depth + 1);
+        if (found) return found;
+      }
+    }
+    return '';
+  }
+
+  function normalizeProjectSourceFile(file) {
+    if (!file || typeof file !== 'object') return null;
+    const deepFileId = deepStringByKeys(file, new Set(['file_id', 'fileid', 'asset_id']));
+    const rawId = typeof file.id === 'string' ? file.id : '';
+    const id = String(file.file_id || file.fileId || file.asset_id || deepFileId || (/^file(?:_|-)/i.test(rawId) ? rawId : '')).trim();
+    if (!id) return null;
+    const libraryFileId = String(
+      file.library_file_id || file.libraryFileId || file.library_download_id || file.libraryDownloadId ||
+      deepStringByKeys(file, new Set(['library_file_id', 'libraryfileid', 'library_download_id', 'librarydownloadid'])) ||
+      (/^libfile(?:_|-)/i.test(rawId) ? rawId : '')
+    ).trim();
+    const sourceProjectId = String(
+      file.gizmo_id || file.gizmoId || file.project_id || file.projectId ||
+      deepStringByKeys(file, new Set(['gizmo_id', 'gizmoid', 'project_id', 'projectid'])) || ''
+    ).trim();
+    const name = candidateText(file.name || file.file_name || file.filename || file.display_name || file.title || id) || id;
+    return {
+      id,
+      libraryFileId,
+      sourceProjectId,
+      isProject: file.is_project === true || file.isProject === true,
+      source: String(file.source || file.file_source || '').trim(),
+      name,
+      type: String(file.type || file.mime_type || file.content_type || '').trim(),
+      size: Number(file.size ?? file.file_size ?? file.file_size_bytes ?? 0) || 0,
+      url: String(file.download_url || file.downloadUrl || file.file_url || file.fileUrl || file.url || '').trim(),
+      pointer: String(file.asset_pointer || file.pointer || '').trim(),
+      raw: file
+    };
+  }
+
+  function collectProjectSourceMetadataValues(file) {
+    const out = [];
+    const seen = new Set();
+    const add = (value, key = '') => {
+      if (typeof value !== 'string') return;
+      const text = value.trim();
+      if (!text || seen.has(text)) return;
+      const k = String(key || '').toLowerCase();
+      const useful = /(?:url|uri|href|download|pointer|asset|path|source|file)/i.test(k) ||
+        /^(?:https?:\/\/|\/backend-api\/|file-service:\/\/|sandbox:\/)/i.test(text);
+      if (!useful) return;
+      seen.add(text);
+      out.push(text);
+    };
+    const walk = (value, depth = 0, key = '') => {
+      if (depth > 6 || value == null) return;
+      if (typeof value === 'string') { add(value, key); return; }
+      if (Array.isArray(value)) {
+        value.forEach((item) => walk(item, depth + 1, key));
+        return;
+      }
+      if (typeof value !== 'object') return;
+      for (const [childKey, childValue] of Object.entries(value)) {
+        walk(childValue, depth + 1, childKey);
+      }
+    };
+    walk(file?.raw || file, 0, 'file');
+    add(file?.url, 'url');
+    add(file?.pointer, 'pointer');
+    return out;
+  }
+
+  function projectSourceFilesFromPayload(data, projectId = '') {
+    const candidates = [];
+    const push = (value) => {
+      if (!Array.isArray(value)) return;
+      value.forEach((file) => {
+        const normalized = normalizeProjectSourceFile(file);
+        if (normalized) candidates.push(normalized);
+      });
+    };
+    push(data?.files);
+    push(data?.knowledge_files);
+    push(data?.knowledgeFiles);
+    push(data?.attachments);
+    push(data?.gizmo?.files);
+    push(data?.gizmo?.knowledge_files);
+    push(data?.gizmo?.knowledgeFiles);
+    push(data?.gizmo?.gizmo?.files);
+    push(data?.gizmo?.gizmo?.knowledge_files);
+    push(data?.project?.files);
+    push(data?.project?.knowledge_files);
+    push(data?.project?.knowledgeFiles);
+    push(data?.project?.gizmo?.files);
+
+    const items = Array.isArray(data?.items) ? data.items : [];
+    for (const item of items) {
+      const wrapper = item?.gizmo || item || {};
+      const gizmo = wrapper?.gizmo || wrapper;
+      const id = String(gizmo?.id || wrapper?.id || '').trim();
+      if (projectId && id && id !== projectId) continue;
+      push(wrapper?.files);
+      push(gizmo?.files);
+    }
+
+    const byId = new Map();
+    for (const file of candidates) if (!byId.has(file.id)) byId.set(file.id, file);
+    return Array.from(byId.values());
+  }
+
+  async function fetchProjectSourcesMetadata(projectId) {
+    const pid = String(projectId || '').trim();
+    if (!pid) throw new Error('PROJECT_ID_NOT_FOUND');
+    const errors = [];
+    let files = [];
+    let detail = null;
+
+    try {
+      const response = await fetch(`${location.origin}/backend-api/gizmos/${encodeURIComponent(pid)}`, {
+        method: 'GET', credentials: 'include', cache: 'no-store', headers: await chatGptApiHeaders(pid)
+      });
+      if (!response.ok) throw new Error(`PROJECT_DETAIL_HTTP_${response.status}`);
+      detail = await response.json();
+      files = projectSourceFilesFromPayload(detail, pid);
+      log(`project sources detail project=${pid} files=${files.length}`);
+    } catch (error) {
+      errors.push(`detail:${error?.message || error}`);
+      log(`project sources detail failed project=${pid} ${error?.message || error}`);
+    }
+
+    if (!files.length) {
+      for (const ownedOnly of [true, false]) {
+        try {
+          const url = `${location.origin}/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0&owned_only=${ownedOnly ? 'true' : 'false'}`;
+          const response = await fetch(url, {
+            method: 'GET', credentials: 'include', cache: 'no-store', headers: await chatGptApiHeaders(pid)
+          });
+          if (!response.ok) throw new Error(`PROJECT_SIDEBAR_HTTP_${response.status}`);
+          const data = await response.json();
+          const sidebarFiles = projectSourceFilesFromPayload(data, pid);
+          if (sidebarFiles.length) {
+            files = sidebarFiles;
+            log(`project sources sidebar project=${pid} files=${files.length} ownedOnly=${ownedOnly}`);
+            break;
+          }
+        } catch (error) {
+          errors.push(`sidebar:${error?.message || error}`);
+          log(`project sources sidebar failed project=${pid} ${error?.message || error}`);
+        }
+      }
+    }
+
+    if (!files.length && errors.length) throw new Error(errors.join(' | '));
+    return { files, detail };
+  }
+
+  async function projectFileApiHeaders() {
+    const auth = await ensureAuthState();
+    const headers = new Headers();
+    if (auth.token) headers.set('authorization', `Bearer ${auth.token}`);
+    if (auth.accountId) headers.set('chatgpt-account-id', auth.accountId);
+    headers.set('accept', 'application/json, application/octet-stream, */*');
+    return headers;
+  }
+
+  async function fetchProjectFileApiBytes(url) {
+    const response = await fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'follow',
+      cache: 'no-store',
+      headers: await projectFileApiHeaders()
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`PROJECT_FILE_HTTP_${response.status}${text ? `_${text.slice(0, 100).replace(/\s+/g, '_')}` : ''}`);
+    }
+
+    const contentType = String(response.headers.get('content-type') || '');
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const metaUrl = metaDownloadUrlFromBytes(bytes, contentType);
+    if (metaUrl) {
+      let resolved = metaUrl;
+      try { resolved = new URL(metaUrl, location.origin).href; } catch { /* keep raw URL */ }
+      const downloaded = await fetchAttachmentBytes(resolved);
+      if (!downloaded?.bytes?.length) throw new Error('PROJECT_FILE_EMPTY_SIGNED_DOWNLOAD');
+      return downloaded;
+    }
+    if (!bytes.length) throw new Error('PROJECT_FILE_EMPTY_RESPONSE');
+    return { bytes, contentType, finalUrl: response.url || url, size: bytes.length };
+  }
+
+  function validateProjectSourcePayload(result) {
+    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(result?.bytes || []);
+    if (!bytes.length) throw new Error('PROJECT_SOURCE_EMPTY_FILE');
+    const contentType = String(result?.contentType || '').toLowerCase();
+    if (contentType.includes('text/html')) throw new Error('PROJECT_SOURCE_HTML_INSTEAD_OF_FILE');
+    return result;
+  }
+
+  function projectSourceResponseUrl(data) {
+    if (!data || typeof data !== 'object') return '';
+    return String(data.download_url || data.downloadUrl || data.url || data.file_url || '').trim();
+  }
+
+  function projectSourceLibraryId(data) {
+    if (!data || typeof data !== 'object') return '';
+    return String(
+      data.library_file_id || data.libraryFileId || data.library_download_id || data.libraryDownloadId ||
+      deepStringByKeys(data, new Set(['library_file_id', 'libraryfileid', 'library_download_id', 'librarydownloadid'])) || ''
+    ).trim();
+  }
+
+  function projectSourceGizmoId(data) {
+    if (!data || typeof data !== 'object') return '';
+    return String(
+      data.gizmo_id || data.gizmoId || data.project_id || data.projectId ||
+      deepStringByKeys(data, new Set(['gizmo_id', 'gizmoid', 'project_id', 'projectid'])) || ''
+    ).trim();
+  }
+
+  async function fetchProjectSourceJson(url) {
+    const response = await fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'error',
+      cache: 'no-store',
+      headers: await projectFileApiHeaders()
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`PROJECT_SOURCE_JSON_HTTP_${response.status}${text ? `_${text.slice(0, 120).replace(/\s+/g, '_')}` : ''}`);
+    }
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('json')) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`PROJECT_SOURCE_JSON_BAD_TYPE_${contentType || 'unknown'}_${text.slice(0, 80).replace(/\s+/g, '_')}`);
+    }
+    return response.json();
+  }
+
+  function describeProjectContentRoute(url) {
+    try {
+      const u = new URL(String(url || ''), location.origin);
+      if (u.origin === location.origin && /^\/api\/library\/files\/[^/]+\/project-content$/i.test(u.pathname)) return 'project-content';
+      if (u.origin === location.origin && /\/backend-api\/estuary\/content$/i.test(u.pathname)) return 'estuary-content';
+      if (u.hostname.toLowerCase().endsWith('.oaiusercontent.com')) return 'oaiusercontent';
+      if (u.hostname.toLowerCase().endsWith('.blob.core.windows.net')) return 'blob-storage';
+      return `${u.origin}${u.pathname}`;
+    } catch {
+      return 'unparsed';
+    }
+  }
+
+  async function fetchAuthorizedProjectSourceContent(downloadUrl, expectedLibraryId = '', expectedFileId = '') {
+    let resolved;
+    try { resolved = new URL(String(downloadUrl || ''), location.origin); }
+    catch { throw new Error('PROJECT_SOURCE_BAD_DOWNLOAD_URL'); }
+
+    if (resolved.origin === location.origin) {
+      const path = resolved.pathname;
+      const projectContent = /^\/api\/library\/files\/([^/]+)\/project-content$/i.exec(path);
+      if (projectContent) {
+        const routeLibraryId = decodeURIComponent(projectContent[1] || '');
+        const routeFileIds = resolved.searchParams.getAll('file_id');
+        if (expectedLibraryId && routeLibraryId !== expectedLibraryId) throw new Error('PROJECT_SOURCE_LIBRARY_ID_MISMATCH');
+        if (expectedFileId && (!routeFileIds.length || !routeFileIds.includes(expectedFileId))) throw new Error('PROJECT_SOURCE_FILE_ID_MISMATCH');
+      } else if (!/\/backend-api\/estuary\/content$/i.test(path)) {
+        throw new Error('PROJECT_SOURCE_UNEXPECTED_SAME_ORIGIN_ROUTE');
+      }
+
+      try {
+        const response = await fetch(resolved.href, {
+          method: 'GET',
+          credentials: 'include',
+          redirect: 'follow',
+          cache: 'no-store'
+        });
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          throw new Error(`PROJECT_SOURCE_CONTENT_HTTP_${response.status}${text ? `_${text.slice(0, 100).replace(/\s+/g, '_')}` : ''}`);
+        }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const result = {
+          bytes,
+          contentType: String(response.headers.get('content-type') || ''),
+          finalUrl: response.url || resolved.href,
+          size: bytes.length
+        };
+        validateProjectSourcePayload(result);
+        return result;
+      } catch (error) {
+        // p24 fallback through the extension service worker for the exact same
+        // server-authorized URL. No guessed endpoint or scope is introduced.
+        try {
+          const viaBackground = await fetchAttachmentBytes(resolved.href);
+          validateProjectSourcePayload(viaBackground);
+          return viaBackground;
+        } catch (backgroundError) {
+          throw new Error(`${error?.message || error} | BACKGROUND_${backgroundError?.message || backgroundError}`);
+        }
+      }
+    }
+
+    const result = await fetchAttachmentBytes(resolved.href);
+    validateProjectSourcePayload(result);
+    return result;
+  }
+
+  async function fetchProjectSourceBytes(file, projectId) {
+    const fileId = String(file?.id || '').trim();
+    const fileName = safeZipAttachmentName(file?.name || fileId || 'source');
+    const pid = String(projectId || currentProjectId() || '').trim();
+    if (!fileId) throw new Error('PROJECT_SOURCE_FILE_ID_MISSING');
+    if (!pid) throw new Error('PROJECT_SOURCE_PROJECT_ID_MISSING');
+
+    // p24: use ChatGPT's actual project-file flow.
+    // 1) authoritative project metadata: /files/{file_id}/simple?gizmo_id=...
+    // 2) download authorization: /files/download/{file_id}?gizmo_id=...&download_intent=true
+    // 3) fetch the exact server-returned content URL (often project-content or estuary).
+    // This deliberately does NOT use the current chat as the source scope.
+    const encodedFileId = encodeURIComponent(fileId);
+    const metadataUrl = `${location.origin}/backend-api/files/${encodedFileId}/simple?gizmo_id=${encodeURIComponent(pid)}`;
+    log(`project source metadata request ${fileName} fileId=${fileId} gizmo=${pid}`);
+    const metadata = await fetchProjectSourceJson(metadataUrl);
+
+    const metadataFileId = String(metadata?.file_id || metadata?.fileId || fileId).trim();
+    if (metadataFileId && metadataFileId !== fileId) throw new Error('PROJECT_SOURCE_METADATA_FILE_ID_MISMATCH');
+
+    const sourceLibraryId = String(file?.libraryFileId || '').trim();
+    const metadataLibraryId = projectSourceLibraryId(metadata);
+    if (sourceLibraryId && metadataLibraryId && sourceLibraryId !== metadataLibraryId) {
+      throw new Error('PROJECT_SOURCE_METADATA_LIBRARY_ID_MISMATCH');
+    }
+    const effectiveLibraryId = metadataLibraryId || sourceLibraryId;
+
+    const metadataProjectId = projectSourceGizmoId(metadata);
+    if (metadataProjectId && metadataProjectId !== pid) throw new Error('PROJECT_SOURCE_METADATA_PROJECT_ID_MISMATCH');
+    if (metadata?.is_project === false || metadata?.isProject === false) throw new Error('PROJECT_SOURCE_METADATA_NOT_PROJECT_FILE');
+
+    log(`project source metadata ok ${fileName} library=${effectiveLibraryId || 'n/a'} gizmo=${metadataProjectId || pid}`);
+
+    const authorizeUrl = `${location.origin}/backend-api/files/download/${encodedFileId}?gizmo_id=${encodeURIComponent(metadataProjectId || pid)}&download_intent=true`;
+    const authorization = await fetchProjectSourceJson(authorizeUrl);
+    const status = String(authorization?.status || '').toLowerCase();
+    if (status && !['success', 'ok', 'complete', 'completed'].includes(status)) {
+      throw new Error(`PROJECT_SOURCE_AUTH_STATUS_${status}`);
+    }
+    const downloadUrl = projectSourceResponseUrl(authorization);
+    if (!downloadUrl) throw new Error('PROJECT_SOURCE_AUTH_NO_DOWNLOAD_URL');
+
+    log(`project source authorization ok ${fileName} route=${describeProjectContentRoute(downloadUrl)}`);
+    const result = await fetchAuthorizedProjectSourceContent(downloadUrl, effectiveLibraryId, fileId);
+    validateUploadedFilePayload(fileName, result);
+    log(`project source candidate ok ${fileName} official-project-flow bytes=${result.bytes.length} route=${describeProjectContentRoute(result.finalUrl || downloadUrl)}`);
+    return result;
+  }
+
+  async function exportAllProjectSources() {
+    if (runtime.exporting) {
+      setStatus('An export is already running');
+      return;
+    }
+    const projectId = currentProjectId();
+    const identity = getExportIdentity();
+    if (!projectId || !identity.inProject) {
+      setStatus('This chat is not inside a project');
+      log('project sources export refused NOT_IN_PROJECT');
+      return;
+    }
+
+    runtime.exporting = true;
+    runtime.stop = false;
+    resetMetrics('project-sources');
+    const stamp = projectStamp();
+    const projectName = identity.projectName || 'Project';
+    runtime.metrics.projectName = projectName;
+    try {
+      setStatus('Discovering project sources…');
+      const auth = await ensureAuthState();
+      const accountName = auth.accountName || auth.accountId || 'ChatGPT Account';
+      const browserName = await detectBrowserName();
+      const { files: sourceFiles } = await fetchProjectSourcesMetadata(projectId);
+      runtime.metrics.projectAttachmentsFound = sourceFiles.length;
+      log(`project sources export start project=${projectName} id=${projectId} files=${sourceFiles.length}`);
+      if (!sourceFiles.length) throw new Error('NO_PROJECT_SOURCES_FOUND');
+
+      const zipFiles = [];
+      const manifest = [];
+      const usedPaths = new Map();
+      const started = Date.now();
+      for (let i = 0; i < sourceFiles.length; i += 1) {
+        guard(started);
+        const file = sourceFiles[i];
+        const safeName = safeZipAttachmentName(file.name || file.id);
+        const zipPath = uniqueZipAttachmentPath(`Sources/${safeName}`, usedPaths);
+        setStatus(`Project source ${i + 1}/${sourceFiles.length}: ${safeName}`);
+        try {
+          const result = await fetchProjectSourceBytes(file, projectId);
+          zipFiles.push({ name: zipPath, content: result.bytes });
+          manifest.push({ id: file.id, name: file.name, zipPath, type: file.type || '', size: result.bytes.length, status: 'downloaded' });
+          runtime.metrics.projectAttachmentsDownloaded += 1;
+          log(`project source added ${zipPath} bytes=${result.bytes.length}`);
+        } catch (error) {
+          runtime.metrics.projectAttachmentsFailed += 1;
+          manifest.push({ id: file.id, name: file.name, type: file.type || '', size: file.size || 0, status: 'failed', error: String(error?.message || error) });
+          log(`project source error ${safeName} ${error?.message || error}`);
+        }
+      }
+
+      if (sourceFiles.length && runtime.metrics.projectAttachmentsDownloaded === 0) {
+        const firstErrors = manifest.filter((item) => item.status === 'failed').slice(0, 3)
+          .map((item) => `${item.name}: ${item.error || 'download failed'}`)
+          .join(' || ');
+        throw new Error(`NO_PROJECT_SOURCE_FILES_DOWNLOADED${firstErrors ? ` :: ${firstErrors}` : ''}`);
+      }
+
+      const indexLines = [
+        `# Project Sources - ${projectName}`,
+        '',
+        `Project: ${projectName}`,
+        `Project ID: ${projectId}`,
+        `Export date/time: ${humanLocalDateTime()}`,
+        `Sources detected: ${sourceFiles.length}`,
+        `Sources downloaded: ${runtime.metrics.projectAttachmentsDownloaded}`,
+        `Sources failed: ${runtime.metrics.projectAttachmentsFailed}`,
+        '',
+        '## Sources',
+        ''
+      ];
+      manifest.forEach((item, idx) => indexLines.push(`${idx + 1}. ${item.name} — ${item.status}${item.zipPath ? ` — ${item.zipPath}` : ''}`));
+      zipFiles.unshift({ name: 'SOURCES_INDEX.md', content: indexLines.join('\n') + '\n' });
+      zipFiles.unshift({ name: 'sources_manifest.json', content: JSON.stringify({ projectName, projectId, exportedAt: new Date().toISOString(), files: manifest }, null, 2) });
+
+      const zipBytes = makeStoredZip(zipFiles);
+      runtime.metrics.projectZipBytes = zipBytes.length;
+      const filename = `Project_Sources_${underscoreToken(projectName, 'Project')}__${underscoreToken(browserName || 'Browser', 'Browser')}__${underscoreToken(accountName || 'ChatGPT Account', 'ChatGPT_Account')}__export_${stamp}.zip`;
+      runtime.metrics.projectZipFilename = filename;
+      runtime.metrics.filename = filename;
+      await saveBatchZipToDownloads(filename, zipBytes, 'project', projectName, accountName, browserName);
+      setStatus(`Saved: ${filename}`);
+      log(`project sources saved ${filename} files=${runtime.metrics.projectAttachmentsDownloaded}/${sourceFiles.length} bytes=${zipBytes.length}`);
+    } catch (error) {
+      if (String(error?.message || error) === 'STOPPED_BY_USER') setStatus('Stopped');
+      else setStatus(`Error: ${error?.message || error}`);
+      log(`project sources export error ${error?.message || error}`);
+    } finally {
+      runtime.exporting = false;
+      runtime.stop = false;
+      render();
+    }
   }
 
   async function discoverAllAccountChats(started) {
@@ -1442,10 +2169,12 @@
     return list;
   }
 
-  function makeAllChatZipFilename(stamp = projectStamp(), batchIndex = 1, totalBatches = 1, accountName = '') {
-    const accountPart = safeFilenameBase(accountName || 'ChatGPT Account');
-    const prefix = `Export ALL Full Chat - ${accountPart}__export_${stamp}`;
-    if (totalBatches > 1) return `${prefix}__part-${String(batchIndex).padStart(3, '0')}-of-${String(totalBatches).padStart(3, '0')}.zip`;
+  function makeAllChatZipFilename(stamp = projectStamp(), batchIndex = 1, totalBatches = 1, accountName = '', browserName = '', chats = []) {
+    const browserPart = underscoreToken(browserName || 'Browser', 'Browser');
+    const accountPart = underscoreToken(accountName || 'ChatGPT Account', 'ChatGPT_Account');
+    const chatPart = batchChatFilenameToken(chats);
+    const prefix = `Export_ALL_Full_Chat__${chatPart}__${browserPart}__${accountPart}__export_${stamp}`;
+    if (totalBatches > 1) return `${prefix}__part_${String(batchIndex).padStart(3, '0')}_of_${String(totalBatches).padStart(3, '0')}.zip`;
     return `${prefix}.zip`;
   }
 
@@ -1455,21 +2184,27 @@
     runtime.stop = false;
     resetMetrics('all-full-chat');
     runtime.clickedExpandKeys = new Set();
-    await saveState();
-    setStatus('Preparing ALL chat export…');
+    const stamp = projectStamp();
     let handedOff = false;
     try {
-      const stamp = projectStamp();
+      runtime.folderHandle = null;
+      await clearBatchFolderHandle();
+      await chooseBatchFolder(stamp, 'all-chat', false);
+      log(`all-chat save mode=${state.askSave ? 'save-as' : 'autosave'} setOwnLocation=${state.askSave ? 'yes' : 'no'} chatsPerZip=${state.chatsPerZip}`);
+      await saveState();
+      setStatus('Preparing ALL chat export…');
       const auth = await ensureAuthState();
       const accountName = auth.accountName || auth.accountId || 'ChatGPT Account';
-      const zipFilename = makeAllChatZipFilename(stamp, 1, 1, accountName);
+      const browserName = await detectBrowserName();
+      runtime.downloadTarget = `Downloads/${batchDownloadFolder('all-chat', '', accountName, browserName)}/`;
+      const zipFilename = makeAllChatZipFilename(stamp, 1, 1, accountName, browserName);
       runtime.metrics.projectName = 'ALL Chats';
       runtime.metrics.projectZipFilename = zipFilename;
       runtime.metrics.filename = zipFilename;
       const chats = await discoverAllAccountChats(Date.now());
       runtime.metrics.projectChatsDiscovered = chats.length;
       if (!chats.length) throw new Error('NO_ACCOUNT_CHATS_FOUND');
-      if (effectiveAskSave) log('all-chat live export: final ZIP uses browser download after return');
+      log(`all-chat live export autosave target=${runtime.downloadTarget} browser=${browserName} account=${accountName}`);
       const response = await runtimeMessage({
         type: 'CGX_START_LIVE_ALL_CHAT_EXPORT',
         chats,
@@ -1478,7 +2213,8 @@
         returnUrl: location.href,
         stamp,
         zipFilename,
-        accountName
+        accountName,
+        browserName
       });
       if (!response?.ok) throw new Error(response?.error || 'ALL_CHAT_EXPORT_START_FAILED');
       handedOff = true;
@@ -1501,27 +2237,30 @@
     runtime.stop = false;
     resetMetrics('project-full');
     runtime.clickedExpandKeys = new Set();
-    await saveState();
-    setStatus('Preparing project…');
+    const stamp = projectStamp();
     let handedOff = false;
     try {
+      runtime.folderHandle = null;
+      await clearBatchFolderHandle();
+      await chooseBatchFolder(stamp, 'project', false);
+      log(`project save mode=${state.askSave ? 'save-as' : 'autosave'} setOwnLocation=${state.askSave ? 'yes' : 'no'} chatsPerZip=${state.chatsPerZip}`);
+      await saveState();
+      setStatus('Preparing project…');
       const identity = getExportIdentity();
       const basePath = projectBasePath() || findProjectBaseFromActiveLinks();
       if (!identity.inProject || !identity.projectName || !basePath) throw new Error('NOT_IN_PROJECT');
       const projectName = identity.projectName;
+      const auth = await ensureAuthState();
+      const accountName = auth.accountName || auth.accountId || 'ChatGPT Account';
+      const browserName = await detectBrowserName();
       runtime.metrics.projectName = projectName;
-      const stamp = projectStamp();
-      const zipFilename = makeProjectZipFilename(projectName, stamp);
+      const zipFilename = makeProjectZipFilename(projectName, stamp, 1, 1, browserName, accountName);
       runtime.metrics.projectZipFilename = zipFilename;
       runtime.metrics.filename = zipFilename;
       log(`project live export start name=${projectName} base=${basePath}`);
 
-      if (effectiveAskSave) {
-        // A live export navigates the current tab. FileSystem handles cannot reliably
-        // survive that page replacement, so the final ZIP is downloaded after the
-        // extension returns to the starting chat.
-        log('project live export: final ZIP will use browser download after return');
-      }
+      runtime.downloadTarget = `Downloads/${batchDownloadFolder('project', projectName, accountName, browserName)}/`;
+      log(`project live export autosave target=${runtime.downloadTarget} browser=${browserName} account=${accountName}`);
 
       const chats = await discoverProjectChats(Date.now(), basePath, projectName);
       runtime.metrics.projectChatsDiscovered = chats.length;
@@ -1533,9 +2272,12 @@
         projectName,
         basePath,
         timeoutSeconds: state.timeout,
+        chatsPerZip: state.chatsPerZip,
         returnUrl: location.href,
         stamp,
-        zipFilename
+        zipFilename,
+        accountName,
+        browserName
       });
       if (!response?.ok) throw new Error(response?.error || 'PROJECT_LIVE_START_FAILED');
       handedOff = true;
@@ -1582,6 +2324,10 @@
     runtime.exporting = true;
     runtime.stop = false;
     resetMetrics('project-full');
+    const batchIndex = Math.max(1, Number(message.batchIndex || 1));
+    const totalBatches = Math.max(1, Number(message.totalBatches || 1));
+    let batchSaved = false;
+    let continueExport = false;
     const projectName = String(message.projectName || 'Project');
     const rawResults = Array.isArray(message.results) ? message.results : [];
     const failures = Array.isArray(message.failures) ? message.failures : [];
@@ -1593,7 +2339,7 @@
     runtime.metrics.projectTotalMessages = results.reduce((n, r) => n + Number(r.totalMessages || 0), 0);
     runtime.metrics.projectUserMessages = results.reduce((n, r) => n + Number(r.userMessages || 0), 0);
     runtime.metrics.projectAgentMessages = results.reduce((n, r) => n + Number(r.agentMessages || 0), 0);
-    const zipFilename = message.zipFilename || makeProjectZipFilename(projectName, message.stamp || projectStamp());
+    const zipFilename = message.zipFilename || makeProjectZipFilename(projectName, message.stamp || projectStamp(), batchIndex, totalBatches, message.browserName || '', message.accountName || '');
     runtime.metrics.projectZipFilename = zipFilename;
     runtime.metrics.filename = zipFilename;
     (Array.isArray(message.logLines) ? message.logLines : []).forEach((line) => log(`worker ${line}`));
@@ -1620,6 +2366,10 @@
             markdownFilename: result.filename || '',
             name: attachment.name,
             url: attachment.url || '',
+            fileId: String(attachment.fileId || ''),
+            conversationId: String(attachment.conversationId || ''),
+            projectId: String(attachment.projectId || ''),
+            messageId: String(attachment.messageId || ''),
             messageIndex: Number(attachment.messageIndex || 0)
           });
         });
@@ -1669,9 +2419,9 @@
         const fileName = safeZipAttachmentName(attachment.name);
         const zipPath = uniqueZipAttachmentPath(`${attachmentRoot}/Upload/${fileName}`, usedAttachmentPaths);
 
-        if (!attachment.url) {
+        if (!attachment.url && !attachment.fileId) {
           runtime.metrics.projectAttachmentsFailed += 1;
-          log(`attachment skip ${i + 1}/${attachmentRefs.length} no-download-url ${attachment.name}`);
+          log(`attachment skip ${i + 1}/${attachmentRefs.length} no-download-reference ${attachment.name}`);
           continue;
         }
 
@@ -1721,17 +2471,40 @@
       const zipBytes = makeStoredZip(files);
       runtime.metrics.projectZipBytes = zipBytes.length;
       log(`project zip files=${files.length} uploads=${runtime.metrics.projectAttachmentsDownloaded}/${runtime.metrics.projectAttachmentsFound} uploadFailed=${runtime.metrics.projectAttachmentsFailed} downloads=${runtime.metrics.projectDownloadsDownloaded}/${runtime.metrics.projectDownloadsFound} downloadFailed=${runtime.metrics.projectDownloadsFailed} bytes=${zipBytes.length} failedChats=${failures.length}`);
-      await saveZip(zipFilename, zipBytes, null);
-      setStatus(failures.length ? `Saved: ${zipFilename} (${failures.length} error)` : `Saved: ${zipFilename}`);
-      log(`project saved ${zipFilename}`);
-      return { ok: true, filename: zipFilename, version: VERSION };
+      await saveBatchZipToDownloads(zipFilename, zipBytes, 'project', message.projectName || runtime.metrics.projectName || 'Project', message.accountName || '', message.browserName || '');
+      log(`project saved ${zipFilename} target=${runtime.downloadTarget || 'Downloads/ChatGPT-Export/'}`);
+
+      // Acknowledge every saved part. The MV3 background worker persists the
+      // project cursor and resumes the next batch only after this ACK, so a long
+      // ZIP/file phase cannot make the remaining parts disappear.
+      const ack = await runtimeMessage({
+        type: 'CGX_PROJECT_BATCH_SAVED',
+        batchIndex,
+        totalBatches,
+        zipFilename
+      });
+      if (!ack?.ok) throw new Error(ack?.error || 'PROJECT_BATCH_ACK_FAILED');
+      batchSaved = true;
+      continueExport = !ack.done;
+      if (continueExport) {
+        const next = Number(ack.nextBatchIndex || (batchIndex + 1));
+        setStatus(`Saved part ${batchIndex}/${totalBatches}; continuing with part ${next}/${totalBatches}…`);
+        log(`project batch continue ${batchIndex}/${totalBatches} next=${next}`);
+      } else {
+        setStatus(failures.length ? `Saved: ${zipFilename} (${failures.length} error)` : `Saved: ${zipFilename}`);
+        log(`project all batches saved ${totalBatches}/${totalBatches}`);
+        await clearBatchFolderHandle(message.stamp || '');
+      }
+      return { ok: true, filename: zipFilename, batchIndex, totalBatches, continueExport, version: VERSION };
     } catch (error) {
       if (String(error.message) === 'STOPPED_BY_USER') setStatus('Stopped');
       else setStatus(`Error: ${error.message || error}`);
       log(`project final error ${error.message || error}`);
+      await clearBatchFolderHandle(message.stamp || '');
+      try { await runtimeMessage({ type: 'CGX_CANCEL_LIVE_PROJECT_EXPORT' }); } catch { /* best effort */ }
       return { ok: false, error: String(error.message || error), version: VERSION };
     } finally {
-      runtime.exporting = false;
+      runtime.exporting = Boolean(batchSaved && continueExport);
       runtime.stop = false;
       render();
     }
@@ -1760,6 +2533,8 @@
     runtime.exporting = true;
     runtime.stop = false;
     resetMetrics('all-full-chat');
+    let batchSaved = false;
+    let continueExport = false;
     const rawResults = Array.isArray(message.results) ? message.results : [];
     const failures = Array.isArray(message.failures) ? message.failures : [];
     const results = uniqueZipNames(rawResults);
@@ -1770,7 +2545,7 @@
     runtime.metrics.projectTotalMessages = results.reduce((n, r) => n + Number(r.totalMessages || 0), 0);
     runtime.metrics.projectUserMessages = results.reduce((n, r) => n + Number(r.userMessages || 0), 0);
     runtime.metrics.projectAgentMessages = results.reduce((n, r) => n + Number(r.agentMessages || 0), 0);
-    const zipFilename = message.zipFilename || makeAllChatZipFilename(message.stamp || projectStamp(), Number(message.batchIndex || 1), Number(message.totalBatches || 1), message.accountName || authState.accountName || authState.accountId || 'ChatGPT Account');
+    const zipFilename = message.zipFilename || makeAllChatZipFilename(message.stamp || projectStamp(), Number(message.batchIndex || 1), Number(message.totalBatches || 1), message.accountName || authState.accountName || authState.accountId || 'ChatGPT Account', message.browserName || '');
     runtime.metrics.projectZipFilename = zipFilename;
     runtime.metrics.filename = zipFilename;
     (Array.isArray(message.logLines) ? message.logLines : []).forEach((line) => log(`worker ${line}`));
@@ -1790,7 +2565,15 @@
       });
       const attachmentRefs = [];
       results.forEach((result) => (Array.isArray(result.attachments) ? result.attachments : []).forEach((a) => {
-        if (a?.name) attachmentRefs.push({ markdownFilename: result.filename || '', name: a.name, url: a.url || '' });
+        if (a?.name) attachmentRefs.push({
+          markdownFilename: result.filename || '',
+          name: a.name,
+          url: a.url || '',
+          fileId: String(a.fileId || ''),
+          conversationId: String(a.conversationId || ''),
+          projectId: String(a.projectId || ''),
+          messageId: String(a.messageId || '')
+        });
       }));
       const downloadRefs = [];
       results.forEach((result) => (Array.isArray(result.downloads) ? result.downloads : []).forEach((e) => {
@@ -1802,7 +2585,7 @@
       for (let i = 0; state.exportUploadedFiles && i < attachmentRefs.length; i++) {
         const a = attachmentRefs[i], root = attachmentRootFromMarkdownFilename(a.markdownFilename), fileName = safeZipAttachmentName(a.name);
         const zipPath = uniqueZipAttachmentPath(`${root}/Upload/${fileName}`, usedAttachmentPaths);
-        if (!a.url) { runtime.metrics.projectAttachmentsFailed++; continue; }
+        if (!a.url && !a.fileId) { runtime.metrics.projectAttachmentsFailed++; log(`all-chat upload skip ${a.name} no-download-reference`); continue; }
         try { setStatus(`Upload ${i + 1}/${attachmentRefs.length}: ${a.name}`); const d = await fetchUploadedFileBytes(a.url, a); files.push({name:zipPath,content:d.bytes}); runtime.metrics.projectAttachmentsDownloaded++; }
         catch (e) { runtime.metrics.projectAttachmentsFailed++; log(`all-chat upload error ${a.name} ${e?.message || e}`); }
       }
@@ -1815,14 +2598,43 @@
       }
       const zipBytes = makeStoredZip(files);
       runtime.metrics.projectZipBytes = zipBytes.length;
-      await saveZip(zipFilename, zipBytes, null);
-      setStatus(failures.length ? `Saved: ${zipFilename} (${failures.length} error)` : `Saved: ${zipFilename}`);
-      return { ok: true, filename: zipFilename, version: VERSION };
+      await saveBatchZipToDownloads(zipFilename, zipBytes, 'all-chat', '', message.accountName || '', message.browserName || '');
+      log(`all-chat saved ${zipFilename} target=${runtime.downloadTarget || 'Downloads/ChatGPT-Export/'}`);
+
+      // p18: identical save/batch behaviour to Full Project. The next batch starts
+      // only after chrome.downloads reports this part as physically complete.
+      const batchIndex = Number(message.batchIndex || 1);
+      const totalBatches = Number(message.totalBatches || 1);
+      const ack = await runtimeMessage({
+        type: 'CGX_ALL_CHAT_BATCH_SAVED',
+        batchIndex,
+        totalBatches,
+        zipFilename
+      });
+      if (!ack?.ok) throw new Error(ack?.error || 'ALL_CHAT_BATCH_ACK_FAILED');
+      batchSaved = true;
+      continueExport = !ack.done;
+      if (continueExport) {
+        const next = Number(ack.nextBatchIndex || (batchIndex + 1));
+        setStatus(`Saved part ${batchIndex}/${totalBatches}; continuing with part ${next}/${totalBatches}…`);
+        log(`all-chat batch continue ${batchIndex}/${totalBatches} next=${next}`);
+      } else {
+        setStatus(failures.length ? `Saved: ${zipFilename} (${failures.length} error)` : `Saved: ${zipFilename}`);
+        log(`all-chat all batches saved ${totalBatches}/${totalBatches}`);
+        await clearBatchFolderHandle(message.stamp || '');
+      }
+      return { ok: true, filename: zipFilename, batchIndex, totalBatches, continueExport, version: VERSION };
     } catch (error) {
       setStatus(String(error.message) === 'STOPPED_BY_USER' ? 'Stopped' : `Error: ${error.message || error}`);
       log(`all-chat final error ${error.message || error}`);
+      await clearBatchFolderHandle(message.stamp || '');
+      try { await runtimeMessage({ type: 'CGX_CANCEL_LIVE_PROJECT_EXPORT' }); } catch { /* best effort */ }
       return { ok: false, error: String(error.message || error), version: VERSION };
-    } finally { runtime.exporting = false; runtime.stop = false; render(); }
+    } finally {
+      runtime.exporting = Boolean(batchSaved && continueExport);
+      runtime.stop = false;
+      render();
+    }
   }
 
   async function exportChatDataForProject(message = {}) {
@@ -1870,8 +2682,22 @@
         const name = cleanUploadedFilename(entry?.name || '');
         if (!name) return;
         const url = normalizeAttachmentUrl(entry?.url || '');
-        const key = `${name.toLowerCase()}|${url}`;
-        if (!attachmentMap.has(key)) attachmentMap.set(key, { name, url, messageIndex: messageIndex + 1 });
+        const fileId = String(entry?.fileId || pointerToFileId(entry?.url || entry?.pointer || '') || '').trim();
+        const conversationId = String(entry?.conversationId || currentConversationId() || '').trim();
+        const projectId = String(entry?.projectId || currentProjectId() || '').trim();
+        const messageId = String(entry?.messageId || '').trim();
+        const key = `${name.toLowerCase()}|${url}|${fileId}|${conversationId}`;
+        if (!attachmentMap.has(key)) {
+          attachmentMap.set(key, {
+            name,
+            url,
+            fileId,
+            conversationId,
+            projectId,
+            messageId,
+            messageIndex: messageIndex + 1
+          });
+        }
       });
     });
     const attachments = Array.from(attachmentMap.values());
@@ -1918,7 +2744,7 @@
   function buildDevLogSnapshot() {
     const folder = runtime.folderHandle ? runtime.folderHandle.name : 'not set';
     return [
-      `ChatGPT Export @NoXoZ.be - v${VERSION}`,
+      `ChatGPT Export @NoXoZ.be - v${VERSION} ${PATCH}`,
       'DEVELOPER LOG EXPORT',
       `exportedAt=${new Date().toISOString()}`,
       `url=${location.href}`,
@@ -1928,6 +2754,7 @@
       `exportMode=${state.exportMode}`,
       `projectFullUi=${state.projectFullUi}`,
       `allFullUi=${state.allFullUi}`,
+      `projectSourcesUi=${state.projectSourcesUi}`,
       `exportUploadedFiles=${state.exportUploadedFiles}`,
       `exportDownloadedFiles=${state.exportDownloadedFiles}`,
       `visible=${state.visible}`,
@@ -2003,6 +2830,7 @@
     if (typeof window.showDirectoryPicker !== 'function') { setStatus('Folder picker unsupported'); return; }
     try {
       runtime.folderHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      await clearBatchFolderHandle();
       setStatus(`Target: ${runtime.folderHandle.name}`);
       render();
     } catch (error) {
@@ -2449,7 +3277,9 @@
       line = line.replace(/\s+\d+(?:[.,]\d+)?\s*(?:bytes?|b|kb|mb|gb|kib|mib|gib)\s*$/i, '').trim();
 
       if (looksLikeUploadedFilename(line)) {
-        add(line);
+        const wordCount = line.split(/\s+/).filter(Boolean).length;
+        const sentenceLike = wordCount > 9 || /^(?:tu\s+peux|peux[- ]?tu|pouvez[- ]?vous|je\s+veux|fais(?:-moi)?|faites|cr[ée]e?|create|make|g[eé]n[eè]re|nomm[ée]|appelle)/i.test(line);
+        if (!sentenceLike) add(line);
         continue;
       }
 
@@ -2819,7 +3649,9 @@
 
     (raw.match(/sandbox:\/{0,2}mnt\/data\/[^\n\r"'<>`\]]+/ig) || []).forEach(add);
     (raw.match(/\/mnt\/data\/[^\n\r"'<>`\]]+/ig) || []).forEach(add);
-    if (!out.length && fallbackName) add(`/mnt/data/${fallbackName}`);
+    // Never synthesize /mnt/data/<filename> from prose alone. That used to
+    // associate unrelated message/file IDs with a visible filename and could
+    // silently save the wrong payload under the requested name.
     return out;
   }
 
@@ -2854,7 +3686,7 @@
 
   function fileIdsFromText(value) {
     const raw = String(value || '');
-    const ids = raw.match(/file-[A-Za-z0-9_-]{10,}/g) || [];
+    const ids = raw.match(/file[-_][A-Za-z0-9_-]{20,}/gi) || [];
     return Array.from(new Set(ids));
   }
 
@@ -2897,20 +3729,48 @@
     const cacheKey = `${cid}|${pid}`;
     if (conversationDataCache.has(cacheKey)) return conversationDataCache.get(cacheKey);
 
-    const url = `${location.origin}/backend-api/conversation/${encodeURIComponent(cid)}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      credentials: 'include',
-      cache: 'no-store',
-      headers: await chatGptApiHeaders(pid)
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`CONVERSATION_HTTP_${response.status}${text ? `_${text.slice(0, 80).replace(/\s+/g, '_')}` : ''}`);
+    const headers = await chatGptApiHeaders(pid);
+    const urls = [
+      `${location.origin}/backend-api/conversations/${encodeURIComponent(cid)}?include_has_versions=true&num_turns=100`,
+      `${location.origin}/backend-api/conversation/${encodeURIComponent(cid)}`
+    ];
+    let lastError = null;
+
+    for (const url of urls) {
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+          headers
+        });
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          throw new Error(`CONVERSATION_HTTP_${response.status}${text ? `_${text.slice(0, 80).replace(/\s+/g, '_')}` : ''}`);
+        }
+
+        const data = await response.json();
+        // Since August 2026 ChatGPT serves /conversations/{id} with a flat
+        // messages[] array instead of the former mapping tree. The file
+        // collectors below intentionally keep their mapping-based traversal,
+        // so create a compatibility mapping without changing their logic.
+        if (!data?.mapping && Array.isArray(data?.messages)) {
+          const mapping = {};
+          data.messages.forEach((message, index) => {
+            const id = String(message?.id || `cgx-message-${index + 1}`);
+            mapping[id] = { id, message };
+          });
+          data.mapping = mapping;
+        }
+
+        conversationDataCache.set(cacheKey, data);
+        return data;
+      } catch (error) {
+        lastError = error;
+      }
     }
-    const data = await response.json();
-    conversationDataCache.set(cacheKey, data);
-    return data;
+
+    throw lastError || new Error('CONVERSATION_FETCH_FAILED');
   }
 
   function conversationDownloadEndpointCandidates(conversationId, messageId, sandboxPath) {
@@ -2921,28 +3781,48 @@
 
     const base = `${location.origin}/backend-api/conversation/${encodeURIComponent(cid)}/interpreter/download`;
     const out = [];
-    if (mid) {
-      const withMessage = new URLSearchParams();
-      withMessage.set('message_id', mid);
-      withMessage.set('sandbox_path', path);
-      out.push(`${base}?${withMessage.toString()}`);
-    }
+    const add = (messageIdValue) => {
+      const params = new URLSearchParams();
+      if (messageIdValue) params.set('message_id', messageIdValue);
+      params.set('sandbox_path', path);
+      out.push(`${base}?${params.toString()}`);
+    };
 
-    const noMessage = new URLSearchParams();
-    noMessage.set('sandbox_path', path);
-    out.push(`${base}?${noMessage.toString()}`);
+    // ChatGPT's current sandbox download flow requires message_id.
+    // Do not issue the no-message fallback: it deterministically returns 422
+    // and makes large project exports look stalled while useless retries run.
+    if (mid) add(mid);
     return out;
   }
 
-  function fileDownloadEndpointCandidates(fileId) {
+  function fileDownloadEndpointCandidates(fileId, conversationId = '') {
     const fid = String(fileId || '').trim();
-    if (!/^file-[A-Za-z0-9_-]{10,}$/.test(fid)) return [];
-    return [
-      `${location.origin}/backend-api/files/download/${encodeURIComponent(fid)}?inline=false`,
-      `${location.origin}/backend-api/files/download/${encodeURIComponent(fid)}`,
-      `${location.origin}/backend-api/files/${encodeURIComponent(fid)}/download`
-    ];
+    if (!/^file[-_][A-Za-z0-9_-]{20,}$/i.test(fid)) return [];
+    const out = [];
+    const cid = String(conversationId || '').trim();
+    const encoded = encodeURIComponent(fid);
+    const add = (value) => { if (value) out.push(value); };
+
+    // Current ChatGPT file endpoint. Some historical assets reject or 404 when
+    // conversation_id is supplied even though the same file ID is still valid,
+    // so always try both scoped and unscoped forms.
+    if (cid) {
+      add(`${location.origin}/backend-api/files/download/${encoded}?conversation_id=${encodeURIComponent(cid)}&inline=false`);
+      add(`${location.origin}/backend-api/files/download/${encoded}?conversation_id=${encodeURIComponent(cid)}&post_id=&inline=false`);
+    }
+    add(`${location.origin}/backend-api/files/download/${encoded}?inline=false`);
+    add(`${location.origin}/backend-api/files/download/${encoded}?post_id=&inline=false`);
+
+    // Older/current variants can return JSON metadata containing download_url.
+    add(`${location.origin}/backend-api/files/${encoded}/download`);
+    add(`${location.origin}/backend-api/files/${encoded}`);
+
+    // Estuary is the final content route for many file-service assets. A bare
+    // authenticated ID works for some historical assets; keep it last.
+    add(`${location.origin}/backend-api/estuary/content?id=${encoded}`);
+    return Array.from(new Set(out));
   }
+
 
   function findConversationDownloadCandidates(data, fileName, conversationId) {
     const target = canonicalDownloadFilename(fileName || '');
@@ -2951,6 +3831,10 @@
 
     const out = [];
     const seen = new Set();
+    const basenameMatches = (value) => {
+      const candidate = canonicalDownloadFilename(downloadFilenameFromHref(value || '') || String(value || '').split('/').pop() || '');
+      return Boolean(candidate && candidate.toLowerCase() === targetLow);
+    };
     const add = (candidate) => {
       const item = Object.assign({ conversationId }, candidate || {});
       const key = [item.url || '', item.sandboxPath || '', item.fileId || '', item.messageId || ''].join('|');
@@ -2963,31 +3847,22 @@
       if (!node || depth > 32) return;
       if (typeof node === 'string') {
         if (!node.toLowerCase().includes(targetLow)) return;
-        downloadUrlsFromText(node).forEach((url) => add({ url, messageId: ctx.messageId || '' }));
-        sandboxPathsFromText(node, target).forEach((sandboxPath) => add({ sandboxPath, messageId: ctx.messageId || '' }));
-        fileIdsFromText(node).forEach((fileId) => add({ fileId, messageId: ctx.messageId || '' }));
+        downloadUrlsFromText(node)
+          .filter(basenameMatches)
+          .forEach((url) => add({ url, messageId: ctx.messageId || '' }));
+        sandboxPathsFromText(node, target)
+          .filter(basenameMatches)
+          .forEach((sandboxPath) => add({ sandboxPath, messageId: ctx.messageId || '' }));
+        // Do not harvest arbitrary file IDs from a larger object merely because
+        // the target filename appears somewhere else in that object. Structured
+        // metadata extraction already pairs real file IDs with their filenames.
         return;
       }
       if (typeof node !== 'object') return;
 
       const nextCtx = Object.assign({}, ctx, { messageId: localMessageIdFromObject(node, ctx.messageId || '') });
-
-      if (!Array.isArray(node)) {
-        const strings = collectStringsDeep(node, 4, []);
-        if (strings.some((s) => String(s).toLowerCase().includes(targetLow))) {
-          strings.forEach((s) => {
-            downloadUrlsFromText(s).forEach((url) => add({ url, messageId: nextCtx.messageId || '' }));
-            sandboxPathsFromText(s, target).forEach((sandboxPath) => add({ sandboxPath, messageId: nextCtx.messageId || '' }));
-            fileIdsFromText(s).forEach((fileId) => add({ fileId, messageId: nextCtx.messageId || '' }));
-          });
-        }
-      }
-
-      if (Array.isArray(node)) {
-        node.forEach((item) => walk(item, nextCtx, depth + 1));
-      } else {
-        Object.keys(node).forEach((key) => walk(node[key], nextCtx, depth + 1));
-      }
+      if (Array.isArray(node)) node.forEach((item) => walk(item, nextCtx, depth + 1));
+      else Object.keys(node).forEach((key) => walk(node[key], nextCtx, depth + 1));
     };
 
     walk(data, {}, 0);
@@ -3030,7 +3905,7 @@
     seen.add(key);
     out.push({
       name,
-      url: url || (fileId ? `${location.origin}/backend-api/files/download/${encodeURIComponent(fileId)}?inline=false` : ''),
+      url: url || (fileId ? `${location.origin}/backend-api/files/download/${encodeURIComponent(fileId)}?conversation_id=${encodeURIComponent(String(candidate?.conversationId || ''))}&inline=false` : ''),
       sandboxPath,
       fileId,
       conversationId: String(candidate?.conversationId || ''),
@@ -3071,7 +3946,7 @@
     let url = String(candidate?.url || '').trim();
 
     if (!url && fileId) {
-      url = `${location.origin}/backend-api/files/download/${encodeURIComponent(fileId)}?inline=false`;
+      url = `${location.origin}/backend-api/files/download/${encodeURIComponent(fileId)}?conversation_id=${encodeURIComponent(String(candidate?.conversationId || ''))}&inline=false`;
     }
 
     if (!name || !looksLikeUploadedFilename(name)) return;
@@ -3264,23 +4139,19 @@
         const refStrings = collectStringsDeep(ref, 5, []);
         refStrings.forEach((value) => {
           sandboxPathsFromText(value, refName).forEach((sandboxPath) => {
+            const pathName = canonicalDownloadFilename(downloadFilenameFromHref(`sandbox:${sandboxPath}`));
+            if (refName && pathName && pathName.toLowerCase() !== canonicalDownloadFilename(refName).toLowerCase()) return;
             addApiDownloadCandidate(out, seen, {
-              name: refName || downloadFilenameFromHref(`sandbox:${sandboxPath}`),
+              name: refName || pathName,
               sandboxPath,
               conversationId: cid,
               projectId: msgProjectId,
               messageId
             });
           });
-          fileIdsFromText(value).forEach((fileId) => {
-            addApiDownloadCandidate(out, seen, {
-              name: refName || fileId,
-              fileId,
-              conversationId: cid,
-              projectId: msgProjectId,
-              messageId
-            });
-          });
+          // File IDs are only trusted when they come from the structured fields
+          // above. Pulling every file_* token out of nested text caused one valid
+          // payload to be reused under several unrelated filenames.
         });
       };
 
@@ -3402,6 +4273,16 @@
       throw new Error(`${label}_REJECTED_BAD_SIGNATURE`);
     }
 
+    const bytes = result?.bytes instanceof Uint8Array ? result.bytes : new Uint8Array(result?.bytes || []);
+    const isPdf = bytesStartWith(bytes, [0x25, 0x50, 0x44, 0x46]);
+    const isZip = bytesStartWith(bytes, [0x50, 0x4b]);
+    const isPng = bytesStartWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const isJpeg = bytesStartWith(bytes, [0xff, 0xd8, 0xff]);
+    const expectsText = /\.(?:txt|md|markdown|csv|xml|ya?ml|json|js|mjs|cjs|ts|tsx|jsx|css|scss|sh|bash|zsh|ps1|bat|cmd|log|sql|py)$/i.test(name);
+    if (expectsText && (isPdf || isZip || isPng || isJpeg)) {
+      throw new Error(`${label}_REJECTED_TYPE_MISMATCH`);
+    }
+
     return result;
   }
 
@@ -3417,6 +4298,7 @@
     const raw = String(url || '').trim();
     const fileName = canonicalDownloadFilename(entry?.name || '') || cleanUploadedFilename(entry?.name || '');
     const projectId = String(entry?.projectId || currentProjectId() || '').trim();
+    const conversationId = String(entry?.conversationId || currentConversationId() || '').trim();
     const fileId = String(entry?.fileId || pointerToFileId(raw) || '').trim();
     const errors = [];
     const tried = new Set();
@@ -3450,9 +4332,47 @@
       if (direct) return direct;
     }
 
-    for (const endpoint of fileDownloadEndpointCandidates(fileId)) {
+    for (const endpoint of fileDownloadEndpointCandidates(fileId, conversationId)) {
       const byFileId = await attempt(endpoint, 'file-id');
       if (byFileId) return byFileId;
+    }
+
+    // Project/ALL exports finish on another chat page. Re-resolve the upload
+    // against the source conversation so stale DOM URLs or stripped metadata
+    // do not make the file disappear from Upload/.
+    if (conversationId && fileName) {
+      try {
+        const conversationData = await fetchConversationJson(conversationId, projectId);
+        const apiUploads = collectConversationApiUploadEntries(conversationData, conversationId, projectId)
+          .filter((candidate) => String(candidate?.name || '').toLowerCase() === fileName.toLowerCase());
+        log(`upload api candidates ${fileName} count=${apiUploads.length}`);
+
+        for (const candidate of apiUploads) {
+          const candidateProjectId = String(candidate?.projectId || projectId || '').trim();
+          if (candidate?.url) {
+            const byUrl = await attempt(candidate.url, 'api-url');
+            if (byUrl) return byUrl;
+          }
+          const candidateFileId = String(candidate?.fileId || '').trim();
+          for (const endpoint of fileDownloadEndpointCandidates(candidateFileId, conversationId)) {
+            const href = String(endpoint || '').trim();
+            if (!href || tried.has(href)) continue;
+            tried.add(href);
+            try {
+              const result = await fetchBackendApiBytes(href, candidateProjectId);
+              validateUploadedFilePayload(fileName || href, result);
+              log(`upload candidate ok api-file-id ${href} bytes=${result.bytes.length}`);
+              return result;
+            } catch (error) {
+              errors.push(`api-file-id:${error?.message || error}`);
+              log(`upload candidate failed api-file-id ${href} ${error?.message || error}`);
+            }
+          }
+        }
+      } catch (error) {
+        errors.push(`conversation-api:${error?.message || error}`);
+        log(`upload api resolution failed ${fileName} ${error?.message || error}`);
+      }
     }
 
     throw new Error(errors.length ? errors.join(' | ') : 'UPLOAD_FETCH_FAILED');
@@ -3517,7 +4437,7 @@
       if (direct) return direct;
     }
 
-    for (const endpoint of fileDownloadEndpointCandidates(fileId)) {
+    for (const endpoint of fileDownloadEndpointCandidates(fileId, conversationId)) {
       const byFileId = await attempt(endpoint, 'entry-file-id');
       if (byFileId) return byFileId;
     }
@@ -3530,17 +4450,23 @@
     if (conversationId && fileName) {
       try {
         const conversationData = await fetchConversationJson(conversationId, projectId);
-        const apiCandidates = findConversationDownloadCandidates(conversationData, fileName, conversationId);
         const fullApiCandidates = collectConversationApiDownloadEntries(conversationData, conversationId, projectId)
           .filter((candidate) => String(candidate?.name || '').toLowerCase() === fileName.toLowerCase());
-        log(`download api candidates ${fileName} count=${apiCandidates.length + fullApiCandidates.length}`);
+        // The recursive compatibility scan can explode on generic labels such as
+        // "Copy" because the word appears throughout a conversation. Only use
+        // that fallback for real filename-shaped names and cap it to avoid
+        // hundreds of network attempts per file.
+        const fallbackApiCandidates = /\.[A-Za-z0-9]{1,12}$/i.test(fileName)
+          ? findConversationDownloadCandidates(conversationData, fileName, conversationId).slice(0, 24)
+          : [];
+        log(`download api candidates ${fileName} structured=${fullApiCandidates.length} fallback=${fallbackApiCandidates.length}`);
 
-        for (const candidate of [...fullApiCandidates, ...apiCandidates]) {
+        for (const candidate of [...fullApiCandidates, ...fallbackApiCandidates]) {
           if (candidate.url && !/^sandbox:/i.test(candidate.url)) {
             const byUrl = await attempt(candidate.url, 'api-url');
             if (byUrl) return byUrl;
           }
-          for (const endpoint of fileDownloadEndpointCandidates(candidate.fileId)) {
+          for (const endpoint of fileDownloadEndpointCandidates(candidate.fileId, conversationId)) {
             const byFileId = await attempt(endpoint, 'file-id');
             if (byFileId) return byFileId;
           }

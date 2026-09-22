@@ -1,4 +1,4 @@
-# SECURITY - ChatGPT Export by NoXoZ.be v6.1.2
+# SECURITY - ChatGPT Export by NoXoZ.be v6.1.4
 
 > Independent project. Not affiliated with, endorsed by, sponsored by, or officially connected to OpenAI. Author: Bruno DELNOZ / NoXoZ.be.
 

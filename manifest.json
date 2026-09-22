@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Export by NoXoZ.be",
-  "version": "6.1.2",
-  "version_name": "v6.1.2",
+  "version": "6.1.4",
+  "version_name": "v6.1.4",
   "description": "Independent local exporter for ChatGPT chats, projects, and all-account chat archives: Markdown ZIP archives with Upload/Download folders and indexes.",
   "action": {
-    "default_title": "ChatGPT Export v6.1.2",
+    "default_title": "ChatGPT Export v6.1.4",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
@@ -15,9 +15,11 @@
   },
   "permissions": [
     "activeTab",
+    "downloads",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "offscreen"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",

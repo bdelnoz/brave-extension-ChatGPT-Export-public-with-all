@@ -1,4 +1,4 @@
-# ChatGPT Export by NoXoZ.be - v6.1.2
+# ChatGPT Export by NoXoZ.be - v6.1.4
 
 > Independent project. Not affiliated with, endorsed by, sponsored by, or officially connected to OpenAI. Author: Bruno DELNOZ / NoXoZ.be.
 
@@ -9,7 +9,7 @@ Independent Brave / Chromium extension for exporting ChatGPT conversations, comp
 - Exports the current ChatGPT conversation as a structured ZIP.
 - Exports an entire ChatGPT Project into a single ZIP.
 - Exports **ALL account chats in Full mode**.
-- Splits ALL Full Chat exports into multiple ZIPs using **Number of chats to export per ZIP** / `#inZip`.
+- Splits ALL Full Chat and Full Project exports into multiple ZIPs using **Number of chats to export per ZIP** / `#inZip`.
 - Uses FULL mode for ALL Full Chat: Start/End message-range options are not used.
 - Creates readable Markdown files.
 - Creates one folder per chat.
@@ -27,7 +27,7 @@ Independent Brave / Chromium extension for exporting ChatGPT conversations, comp
 ### Maxi mode
 
 - `Number of messages to export` — message count used by START and END modes.
-- `Number of chats to export per ZIP` — maximum number of chats in each ALL Full Chat ZIP.
+- `Number of chats to export per ZIP` — maximum number of chats in each ALL Full Chat or Full Project ZIP.
 - `Export Full Project`
 - `Export Uploaded Files`
 - `Export Downloaded Files`
@@ -41,7 +41,7 @@ Independent Brave / Chromium extension for exporting ChatGPT conversations, comp
 ### Mini mode
 
 - `#MSG` — message count used by START and END modes.
-- `#inZip` — maximum number of chats in each ALL Full Chat ZIP.
+- `#inZip` — maximum number of chats in each ALL Full Chat or Full Project ZIP.
 - `FULL`
 - `START`
 - `END`
@@ -58,7 +58,7 @@ Blue means enabled/selected. Gray means disabled/not selected.
 
 `Number of messages to export` and `#MSG` apply to START and END modes. They do **not** limit FULL Chat, FULL Project, or ALL Full Chat exports.
 
-`Number of chats to export per ZIP` and `#inZip` apply to ALL Full Chat only. They control the batch size used to avoid processing a large account in one giant ZIP.
+`Number of chats to export per ZIP` and `#inZip` apply to ALL Full Chat and Full Project. They control the batch size used to avoid processing a large export in one giant ZIP.
 
 ## ALL Full Chat
 
@@ -106,6 +106,10 @@ Export ALL Full Chat - AccountName__export_YYYY-MM-DD-HH-MM-SS__part-001-of-025.
 `-- ...
 ```
 
+## Chat batching
+
+**Number of chats to export per ZIP** / `#inZip` is applied to both **Export Full Project** and **Export ALL Full Chat**. For example, a project containing 12 chats with `#inZip = 5` is exported as 3 sequential ZIP files containing 5, 5 and 2 chats. Each batch is finalized before the next batch starts.
+
 ## Full Project ZIP structure
 
 ```text
@@ -135,4 +139,4 @@ See `DONATE.md`.
 
 ## Product guide
 
-See `ChatGPT-Export_v6.1.2_Product_Guide.pdf`.
+See `ChatGPT-Export_v6.1.4_Product_Guide.pdf`.
