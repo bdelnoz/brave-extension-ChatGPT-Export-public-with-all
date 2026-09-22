@@ -1,6 +1,6 @@
 /*
  * ChatGPT Export - donate-mini.js
- * Version: v6.0.0
+ * Version: v7.0.0
  * Developer: @NoXoZ.be
  *
  * FINAL support button:

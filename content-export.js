@@ -1,6 +1,6 @@
 /*
  * ChatGPT Export - content-export.js
- * Version: v6.1.4
+ * Version: v7.0.0
  * Patch: p24
  * Developer: @NoXoZ.be
  * Local current-chat, project, and ALL-account-chat export.
@@ -8,7 +8,7 @@
 (function cgxInit() {
   'use strict';
 
-  const VERSION = '6.1.4';
+  const VERSION = '7.0.0';
   const PATCH = 'p24';
   const WIDGET_ID = 'cgx-widget';
   const LOADED_KEY = '__CGX_EXPORT_V503_LOADED__';

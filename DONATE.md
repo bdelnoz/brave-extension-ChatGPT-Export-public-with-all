@@ -1,25 +1,23 @@
-# Support ChatGPT Export by NoXoZ.be v6.1.4
+# Support ChatGPT Export by NoXoZ.be v7.0.0
 
-ChatGPT Export is developed and maintained as a free browser extension.
+ChatGPT Export is developed and maintained as a **free** browser extension.
 
-If the extension saves you time or you simply want to support its continued development, maintenance, testing, and future improvements, you can make a voluntary contribution via Stripe.
+If the extension saves you time, or you simply want to support its continued development, maintenance, testing, and future improvements, you can make a voluntary contribution via Stripe.
 
 ## Donate via Stripe
 
-**Stripe Payment Link:**  
+**Stripe payment link:**
 https://donate.stripe.com/6oUdRbfsifpQ8DzbbWfQI00
 
 You can choose the amount you wish to contribute.
 
-Contributions are entirely voluntary. They do not unlock additional features, paid access, priority support, or any other benefit.
+> Contributions are entirely voluntary. They do not unlock additional features, paid access, priority support, or any other benefit.
 
 ## Privacy
 
-The extension itself does not send your ChatGPT conversations, exported files, usage data, telemetry, or analytics to NoXoZ.be.
+The extension itself does **not** send your ChatGPT conversations, exported files, usage data, telemetry, or analytics to NoXoZ.be.
 
-The Stripe payment page is an external service and is opened only when you explicitly choose to support the project.
-
-Payment processing is handled directly by Stripe. No payment card information is processed or stored by the extension.
+The Stripe payment page is an external service, opened only when you explicitly choose to support the project. Payment processing is handled directly by Stripe — no payment card information is processed or stored by the extension.
 
 ## Thank you
 
@@ -27,4 +25,4 @@ Every contribution helps support the continued development and maintenance of Ch
 
 Thank you for supporting independent software development.
 
-— NoXoZ.be
+— **NoXoZ.be**

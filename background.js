@@ -1,12 +1,12 @@
 /*
  * ChatGPT Export - background.js
- * Version: v6.1.4
+ * Version: v7.0.0
  * Patch: p24
  * Developer: @NoXoZ.be
  */
 'use strict';
 
-const VERSION = '6.1.4';
+const VERSION = '7.0.0';
 
 function safeFilenameBase(value) {
   return String(value || 'ChatGPT Account')

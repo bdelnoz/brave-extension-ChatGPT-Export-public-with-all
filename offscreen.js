@@ -1,6 +1,6 @@
 /*
  * ChatGPT Export - offscreen.js
- * Version: v6.1.4
+ * Version: v7.0.0
  * Patch: p12
  * Developer: @NoXoZ.be
  * Large ZIP transfer buffer / Blob URL owner for Manifest V3.
