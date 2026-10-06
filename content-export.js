@@ -2969,7 +2969,172 @@
     await expandVisible(started);
   }
 
+  function apiMessageRole(message) {
+    const raw = String(message?.author?.role || message?.role || '').toLowerCase();
+    if (raw === 'user') return 'User';
+    if (raw === 'assistant' || raw === 'agent') return 'Assistant';
+    if (raw === 'tool') return 'Tool';
+    return '';
+  }
+
+  function apiContentPartToMarkdown(part) {
+    if (part == null) return '';
+    if (typeof part === 'string') return part;
+    if (typeof part !== 'object') return String(part);
+
+    // Current ChatGPT text/message payloads normally expose strings in parts[].
+    // Keep a few structured-text fallbacks for multimodal/current variants, but
+    // deliberately ignore file/image pointer objects here: those are handled by
+    // the dedicated Upload/Download collectors and must not become fake prose.
+    for (const value of [part.text, part.content, part.caption, part.transcript]) {
+      if (typeof value === 'string' && value.trim()) return value;
+      if (value && typeof value === 'object' && typeof value.value === 'string' && value.value.trim()) return value.value;
+    }
+    if (Array.isArray(part.parts)) {
+      return part.parts.map(apiContentPartToMarkdown).filter(Boolean).join('\n\n');
+    }
+    return '';
+  }
+
+  function apiMessageText(message) {
+    const content = message?.content;
+    if (!content) return '';
+
+    if (typeof content === 'string') return content.trim();
+    const contentType = String(content?.content_type || content?.type || '').toLowerCase();
+    const parts = Array.isArray(content?.parts) ? content.parts : [];
+    let text = parts.map(apiContentPartToMarkdown).filter(Boolean).join('\n\n').trim();
+
+    if (!text) {
+      for (const value of [content.text, content.result, content.output_text]) {
+        if (typeof value === 'string' && value.trim()) { text = value.trim(); break; }
+      }
+    }
+
+    // Code payloads can arrive as plain text without fences.
+    if (text && /^(?:code|python|json|javascript|typescript|shell|bash)$/i.test(contentType)) {
+      return `\`\`\`\n${text}\n\`\`\``;
+    }
+    return text;
+  }
+
+  function apiConversationMessageObjects(data) {
+    if (Array.isArray(data?.messages) && data.messages.length) return data.messages;
+
+    const mapping = data?.mapping || {};
+    const current = String(data?.current_node || data?.currentNode || '').trim();
+    if (current && mapping[current]) {
+      const chain = [];
+      const seen = new Set();
+      let id = current;
+      while (id && mapping[id] && !seen.has(id)) {
+        seen.add(id);
+        const node = mapping[id];
+        if (node?.message) chain.push(node.message);
+        id = String(node?.parent || '').trim();
+      }
+      chain.reverse();
+      if (chain.length) return chain;
+    }
+
+    return Object.values(mapping)
+      .map((node) => node?.message || null)
+      .filter(Boolean)
+      .sort((a, b) => {
+        const at = Number(a?.create_time || a?.createTime || 0);
+        const bt = Number(b?.create_time || b?.createTime || 0);
+        return at - bt;
+      });
+  }
+
+  function apiConversationToExportMessages(data) {
+    const objects = apiConversationMessageObjects(data);
+    const out = [];
+    const seen = new Set();
+
+    objects.forEach((message, index) => {
+      if (!message || typeof message !== 'object') return;
+      const role = apiMessageRole(message);
+      if (!role) return; // exclude system/developer/internal records
+      if (message?.metadata?.is_visually_hidden_from_conversation === true) return;
+
+      const text = apiMessageText(message);
+      if (!text) return;
+      const id = String(message?.id || '').trim();
+      const key = id || `${index}:${role}:${text.slice(0, 200)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        role,
+        text,
+        index: out.length + 1,
+        order: index,
+        uploads: [],
+        downloads: []
+      });
+    });
+
+    return out;
+  }
+
+  async function collectConversationFromApi() {
+    const cid = currentConversationId();
+    if (!cid) throw new Error('CONVERSATION_ID_MISSING');
+    const data = await fetchConversationJson(cid, currentProjectId());
+    const messages = apiConversationToExportMessages(data);
+    if (!messages.length) throw new Error('API_NO_MESSAGES');
+    return messages;
+  }
+
+  function bestEffortVisualTop() {
+    const candidates = new Set();
+    const root = document.scrollingElement || document.documentElement;
+    candidates.add(root);
+    candidates.add(document.documentElement);
+    candidates.add(document.body);
+
+    const containers = getContainers();
+    const sample = [containers[0], containers[containers.length - 1]].filter(Boolean);
+    sample.forEach((node) => {
+      let el = node?.parentElement;
+      for (let depth = 0; el && depth < 12; depth += 1, el = el.parentElement) {
+        if (!widget || (el !== widget && !widget.contains(el))) candidates.add(el);
+      }
+    });
+
+    for (const el of candidates) {
+      if (!el) continue;
+      try {
+        const m = scrollMetrics(el);
+        if (isDocumentScroller(el) || m.scrollHeight > m.clientHeight + 80) scrollToPosition(el, 0);
+      } catch { /* best effort only */ }
+    }
+    try { window.scrollTo(0, 0); } catch { /* ignored */ }
+  }
+
   async function collectConversationForExport(started, exportMode = state.exportMode) {
+    // FULL/START/END must be based on the complete conversation, not on the
+    // virtualized ChatGPT DOM. The DOM often contains only ~20 visible turns.
+    // API-first makes single-chat and per-chat project export independent of
+    // scrolling. Keep the existing scroll collector as a compatibility fallback.
+    try {
+      guard(started);
+      // Preserve the traditional visible "go to top" behaviour as a best effort,
+      // but do not rely on it for completeness anymore.
+      bestEffortVisualTop();
+      runtime.metrics.topLoadIterations = Math.max(runtime.metrics.topLoadIterations, 1);
+      await sleep(80);
+      setStatus('Loading complete conversation…');
+      const apiMessages = await collectConversationFromApi();
+      runtime.metrics.messagesCollected = apiMessages.length;
+      runtime.metrics.loopBreakReason = 'api-complete-conversation';
+      log(`conversation collector=api messages=${apiMessages.length}`);
+      setStatus(`Collected ${apiMessages.length} messages`);
+      return apiMessages;
+    } catch (error) {
+      log(`conversation api collector failed ${error?.message || error}; falling back to DOM scroll`);
+    }
+
     const all = new Map();
     if (exportMode === 'full' || exportMode === 'start') await loadFromTop(started);
     await expandVisible(started);
@@ -2982,7 +3147,7 @@
     const messages = Array.from(all.values()).sort((a, b) => a.order - b.order);
     runtime.metrics.messagesCollected = messages.length;
     runtime.metrics.containersSeen = Math.max(runtime.metrics.containersSeen, getContainers().length);
-    log(`index messagesCollected=${messages.length} containersSeen=${runtime.metrics.containersSeen}`);
+    log(`conversation collector=dom messages=${messages.length} containersSeen=${runtime.metrics.containersSeen}`);
     setStatus(`Collected ${messages.length} messages`);
     return messages;
   }
@@ -3731,8 +3896,14 @@
 
     const headers = await chatGptApiHeaders(pid);
     const urls = [
-      `${location.origin}/backend-api/conversations/${encodeURIComponent(cid)}?include_has_versions=true&num_turns=100`,
-      `${location.origin}/backend-api/conversation/${encodeURIComponent(cid)}`
+      // Prefer the full conversation endpoint. ChatGPT's virtualized UI may keep
+      // only a small window of turns in the DOM, so FULL exports must not depend
+      // on what happens to be rendered on screen.
+      `${location.origin}/backend-api/conversation/${encodeURIComponent(cid)}`,
+      // Current flat-message endpoint. Ask for a deliberately large turn window
+      // instead of the old 100-turn cap; the server may clamp it, but this avoids
+      // silently truncating long conversations when this endpoint is used.
+      `${location.origin}/backend-api/conversations/${encodeURIComponent(cid)}?include_has_versions=true&num_turns=9999`
     ];
     let lastError = null;
 
