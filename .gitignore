@@ -1,3 +1,9 @@
+.docs/
+.zip/
+.old/
+.exports/
+
+
 # ========================================
 # ChatGPT Export - .gitignore
 # Release: v7.0.0

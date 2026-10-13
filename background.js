@@ -1,7 +1,7 @@
 /*
  * ChatGPT Export - background.js
  * Version: v7.0.0
- * Patch: p24
+ * Patch: p26
  * Developer: @NoXoZ.be
  */
 'use strict';

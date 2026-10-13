@@ -1,7 +1,7 @@
 /*
  * ChatGPT Export - content-export.js
  * Version: v7.0.0
- * Patch: p24
+ * Patch: p26
  * Developer: @NoXoZ.be
  * Local current-chat, project, and ALL-account-chat export.
  */
@@ -9,7 +9,7 @@
   'use strict';
 
   const VERSION = '7.0.0';
-  const PATCH = 'p24';
+  const PATCH = 'p26';
   const WIDGET_ID = 'cgx-widget';
   const LOADED_KEY = '__CGX_EXPORT_V503_LOADED__';
   const STORAGE_KEY = 'cgx.v3.state';
@@ -639,7 +639,7 @@
     widget.className = `cgx-mode-${state.mode} ${state.dev ? 'cgx-dev' : ''} ${runtime.exporting ? 'cgx-exporting' : ''}`;
     widget.dataset.cgxBatchExport = (!runtime.exporting && (state.projectFullUi || state.allFullUi)) ? '1' : '0';
     widget.dataset.cgxExporting = runtime.exporting ? '1' : '0';
-    widget.dataset.cgxAutosave = 'p24';
+    widget.dataset.cgxAutosave = 'p26';
     widget.style.display = state.visible ? '' : 'none';
     if (!state.visible) return;
     applyModeSize();
@@ -2973,8 +2973,36 @@
     const raw = String(message?.author?.role || message?.role || '').toLowerCase();
     if (raw === 'user') return 'User';
     if (raw === 'assistant' || raw === 'agent') return 'Assistant';
-    if (raw === 'tool') return 'Tool';
     return '';
+  }
+
+  function apiMessageIsUserVisible(message, role) {
+    if (!message || !role) return false;
+    if (message?.metadata?.is_visually_hidden_from_conversation === true) return false;
+
+    // p26: API conversation trees also contain internal reasoning/tool traffic.
+    // Export only what belongs to the visible user/assistant conversation.
+    if (role === 'Assistant') {
+      const recipient = String(message?.recipient || message?.metadata?.recipient || '').trim().toLowerCase();
+      if (recipient && !['all', 'final'].includes(recipient)) return false;
+
+      const channel = String(message?.channel || message?.metadata?.channel || '').trim().toLowerCase();
+      if (channel && !['final', 'commentary'].includes(channel)) return false;
+
+      const contentType = String(message?.content?.content_type || message?.content?.type || '').trim().toLowerCase();
+      const internalTypes = new Set([
+        'thoughts', 'reasoning', 'reasoning_recap', 'analysis',
+        'tool_call', 'tool_calls', 'tool_result', 'tool_results',
+        'computer_initialize_state', 'computer_output',
+        'tether_browsing_display', 'execution_output'
+      ]);
+      if (internalTypes.has(contentType)) return false;
+
+      const authorName = String(message?.author?.name || '').trim().toLowerCase();
+      if (authorName && /(?:tool|python|container|browser|web|computer|code)/.test(authorName)) return false;
+    }
+
+    return true;
   }
 
   function apiContentPartToMarkdown(part) {
@@ -3055,8 +3083,8 @@
     objects.forEach((message, index) => {
       if (!message || typeof message !== 'object') return;
       const role = apiMessageRole(message);
-      if (!role) return; // exclude system/developer/internal records
-      if (message?.metadata?.is_visually_hidden_from_conversation === true) return;
+      if (!role) return; // only User / Assistant are exportable
+      if (!apiMessageIsUserVisible(message, role)) return;
 
       const text = apiMessageText(message);
       if (!text) return;
